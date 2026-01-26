@@ -257,8 +257,7 @@ macro_rules! read_event_impl {
         $read_until_close:ident
         $(, $await:ident)?
     ) => {{
-        let event = loop {
-            break match $self.state.state {
+        let event = match $self.state.state {
                 ParseState::Init => { // Go to InsideText state
                     // If encoding set explicitly, we not need to detect it. For example,
                     // explicit UTF-8 set automatically if Reader was created using `from_str`.
@@ -276,7 +275,8 @@ macro_rules! read_event_impl {
                     $reader.remove_utf8_bom() $(.$await)? ?;
 
                     $self.state.state = ParseState::InsideText;
-                    continue;
+                    $self.read_event_impl($buf) $(.$await)?
+                    // continue;
                 },
                 ParseState::InsideRef => { // Go to InsideText
                     let start = $self.state.offset;
@@ -325,16 +325,20 @@ macro_rules! read_event_impl {
 
                     match $reader.read_text($buf, &mut $self.state.offset) $(.$await)? {
                         ReadTextResult::Markup(buf) => {
-                            $self.state.state = ParseState::InsideMarkup;
+                            $self.read_until_close(buf) $(.$await)?
+
+                            // $self.state.state = ParseState::InsideMarkup;
                             // Pass `buf` to the next next iteration of parsing loop
-                            $buf = buf;
-                            continue;
+                            // $buf = buf;
+                            // continue;
                         }
                         ReadTextResult::Ref(buf) => {
                             $self.state.state = ParseState::InsideRef;
+
+                            $self.read_event_impl(buf) $(.$await)?
                             // Pass `buf` to the next next iteration of parsing loop
-                            $buf = buf;
-                            continue;
+                            // $buf = buf;
+                            // continue;
                         }
                         ReadTextResult::UpToMarkup(bytes) => {
                             $self.state.state = ParseState::InsideMarkup;
@@ -367,7 +371,7 @@ macro_rules! read_event_impl {
                 ParseState::InsideEmpty => Ok(Event::End($self.state.close_expanded_empty())),
                 ParseState::Done => Ok(Event::Eof),
             };
-        };
+
         match event {
             // #513: In case of ill-formed errors we already consume the wrong data
             // and change the state. We can continue parsing if we wish
@@ -983,7 +987,7 @@ impl<R> Reader<R> {
     /// Read text into the given buffer, and return an event that borrows from
     /// either that buffer or from the input itself, based on the type of the
     /// reader.
-    fn read_event_impl<'i, B>(&mut self, mut buf: B) -> Result<Event<'i>, Error>
+    fn read_event_impl<'i, B>(&mut self, buf: B) -> Result<Event<'i>, Error>
     where
         R: XmlSource<'i, B>,
     {
