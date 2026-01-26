@@ -257,7 +257,8 @@ macro_rules! read_event_impl {
         $read_until_close:ident
         $(, $await:ident)?
     ) => {{
-        let event = match $self.state.state {
+        // let event = match $self.state.state {
+        match $self.state.state {
                 ParseState::Init => { // Go to InsideText state
                     // If encoding set explicitly, we not need to detect it. For example,
                     // explicit UTF-8 set automatically if Reader was created using `from_str`.
@@ -275,7 +276,7 @@ macro_rules! read_event_impl {
                     $reader.remove_utf8_bom() $(.$await)? ?;
 
                     $self.state.state = ParseState::InsideText;
-                    $self.read_event_impl($buf) $(.$await)?
+                    return $self.read_event_impl($buf) $(.$await)?;
                     // continue;
                 },
                 ParseState::InsideRef => { // Go to InsideText
@@ -315,7 +316,10 @@ macro_rules! read_event_impl {
                             $self.state.last_error_offset = start;
                             Err(Error::IllFormed(IllFormedError::UnclosedReference))
                         }
-                        ReadRefResult::Err(e) => Err(Error::Io(e.into())),
+                        ReadRefResult::Err(e) => {
+                            $self.state.state = ParseState::Done;
+                            Err(Error::Io(e.into()))
+                        }
                     }
                 }
                 ParseState::InsideText => { // Go to InsideMarkup or Done state
@@ -335,7 +339,7 @@ macro_rules! read_event_impl {
                         ReadTextResult::Ref(buf) => {
                             $self.state.state = ParseState::InsideRef;
 
-                            $self.read_event_impl(buf) $(.$await)?
+                            return $self.read_event_impl(buf) $(.$await)?;
                             // Pass `buf` to the next next iteration of parsing loop
                             // $buf = buf;
                             // continue;
@@ -358,28 +362,33 @@ macro_rules! read_event_impl {
                             // Trim bytes from end if required
                             let event = $self.state.emit_text(bytes);
                             if event.is_empty() {
+                                $self.state.state = ParseState::Done;
+
                                 Ok(Event::Eof)
                             } else {
                                 Ok(Event::Text(event))
                             }
                         }
-                        ReadTextResult::Err(e) => Err(Error::Io(e.into())),
+                        ReadTextResult::Err(e) => {
+                            $self.state.state = ParseState::Done;
+                            Err(Error::Io(e.into()))
+                        }
                     }
                 },
                 // Go to InsideText state in next two arms
                 ParseState::InsideMarkup => $self.$read_until_close($buf) $(.$await)?,
                 ParseState::InsideEmpty => Ok(Event::End($self.state.close_expanded_empty())),
                 ParseState::Done => Ok(Event::Eof),
-            };
+            }
 
-        match event {
+        // match event {
             // #513: In case of ill-formed errors we already consume the wrong data
             // and change the state. We can continue parsing if we wish
-            Err(Error::IllFormed(_)) => {}
-            Err(_) | Ok(Event::Eof) => $self.state.state = ParseState::Done,
-            _ => {}
-        }
-        event
+            // Err(Error::IllFormed(_)) => {}
+            // Err(_) | Ok(Event::Eof) => $self.state.state = ParseState::Done,
+            // _ => {}
+        // }
+        // event
     }};
 }
 
@@ -412,7 +421,7 @@ macro_rules! read_until_close {
         $self.state.state = ParseState::InsideText;
 
         let start = $self.state.offset;
-        match $reader.peek_one() $(.$await)? {
+        let event = match $reader.peek_one() $(.$await)? {
             // `<!` - comment, CDATA or DOCTYPE declaration
             Ok(Some(b'!')) => match $reader
                 .read_bang_element($buf, &mut $self.state.offset)
@@ -482,7 +491,16 @@ macro_rules! read_until_close {
                 Err(Error::Syntax(SyntaxError::UnclosedTag))
             }
             Err(e) => Err(Error::Io(e.into())),
+        };
+
+        match event {
+            // #513: In case of ill-formed errors we already consume the wrong data
+            // and change the state. We can continue parsing if we wish
+            Err(Error::IllFormed(_)) => {}
+            Err(_) => $self.state.state = ParseState::Done,
+            _ => {}
         }
+        event
     }};
 }
 
