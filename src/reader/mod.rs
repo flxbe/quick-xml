@@ -275,8 +275,9 @@ macro_rules! read_event_impl {
                     $reader.remove_utf8_bom() $(.$await)? ?;
 
                     $self.state.state = ParseState::InsideText;
-                    $self.read_event_impl($buf) $(.$await)?
-                    // continue;
+
+                    // Return directly to enable tail call optimization.
+                    return $self.read_event_impl($buf) $(.$await)?;
                 },
                 ParseState::InsideRef => { // Go to InsideText
                     let start = $self.state.offset;
@@ -326,19 +327,11 @@ macro_rules! read_event_impl {
                     match $reader.read_text($buf, &mut $self.state.offset) $(.$await)? {
                         ReadTextResult::Markup(buf) => {
                             $self.read_until_close(buf) $(.$await)?
-
-                            // $self.state.state = ParseState::InsideMarkup;
-                            // Pass `buf` to the next next iteration of parsing loop
-                            // $buf = buf;
-                            // continue;
                         }
                         ReadTextResult::Ref(buf) => {
                             $self.state.state = ParseState::InsideRef;
-
-                            $self.read_event_impl(buf) $(.$await)?
-                            // Pass `buf` to the next next iteration of parsing loop
-                            // $buf = buf;
-                            // continue;
+                            // Return immediately to allow for tail call optimization
+                            return $self.read_event_impl(buf) $(.$await)?;
                         }
                         ReadTextResult::UpToMarkup(bytes) => {
                             $self.state.state = ParseState::InsideMarkup;
@@ -693,7 +686,7 @@ where
 {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let amt = self.inner.read(buf)?;
+        let amt: usize = self.inner.read(buf)?;
         *self.offset += amt as u64;
         Ok(amt)
     }
