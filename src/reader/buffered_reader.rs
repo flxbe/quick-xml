@@ -9,6 +9,7 @@ use crate::errors::{Error, Result};
 use crate::events::Event;
 use crate::name::QName;
 use crate::parser::Parser;
+use crate::reader::state::ReaderState;
 use crate::reader::{BangType, ReadRefResult, ReadTextResult, Reader, Span, XmlSource};
 use crate::utils::is_whitespace;
 
@@ -54,7 +55,7 @@ macro_rules! impl_buffered_source {
         $($async)? fn read_text $(<$lf>)? (
             &mut self,
             buf: &'b mut Vec<u8>,
-            position: &mut u64,
+            state: &mut ReaderState,
         ) -> ReadTextResult<'b, &'b mut Vec<u8>> {
             let mut read = 0;
             let start = buf.len();
@@ -64,7 +65,7 @@ macro_rules! impl_buffered_source {
                     Ok(n) => n,
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        *position += read;
+                        state.offset += read;
                         return ReadTextResult::Err(e);
                     }
                 };
@@ -75,7 +76,7 @@ macro_rules! impl_buffered_source {
                     // On next iterations we already read something and should emit Text event
                     Some(0) if read == 0 && available[0] == b'<' => {
                         self $(.$reader)? .consume(1);
-                        *position += 1;
+                        state.offset += 1;
                         return ReadTextResult::Markup(buf);
                     }
                     // Do not consume `&` because it may be lone and we would be need to
@@ -89,7 +90,7 @@ macro_rules! impl_buffered_source {
                         self $(.$reader)? .consume(used);
                         read += used as u64;
 
-                        *position += read;
+                        state.offset += read;
                         return ReadTextResult::UpToMarkup(&buf[start..]);
                     }
                     Some(i) => {
@@ -98,7 +99,7 @@ macro_rules! impl_buffered_source {
                         self $(.$reader)? .consume(i);
                         read += i as u64;
 
-                        *position += read;
+                        state.offset += read;
                         return ReadTextResult::UpToRef(&buf[start..]);
                     }
                     None => {
@@ -111,7 +112,7 @@ macro_rules! impl_buffered_source {
                 }
             }
 
-            *position += read;
+            state.offset += read;
             ReadTextResult::UpToEof(&buf[start..])
         }
 
@@ -119,7 +120,7 @@ macro_rules! impl_buffered_source {
         $($async)? fn read_ref $(<$lf>)? (
             &mut self,
             buf: &'b mut Vec<u8>,
-            position: &mut u64,
+            state: &mut ReaderState,
         ) -> ReadRefResult<'b> {
             let mut read = 0;
             let start = buf.len();
@@ -129,7 +130,7 @@ macro_rules! impl_buffered_source {
                     Ok(n) => n,
                     Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        *position += read;
+                        state.offset += read;
                         return ReadRefResult::Err(e);
                     }
                 };
@@ -159,7 +160,7 @@ macro_rules! impl_buffered_source {
                         self $(.$reader)? .consume(i);
                         read += i as u64;
 
-                        *position += read;
+                        state.offset += read;
 
                         return ReadRefResult::UpToRef(&buf[start..]);
                     }
@@ -172,7 +173,7 @@ macro_rules! impl_buffered_source {
                         self $(.$reader)? .consume(used);
                         read += used as u64;
 
-                        *position += read;
+                        state.offset += read;
 
                         return if is_end {
                             ReadRefResult::Ref(&buf[start..])
@@ -190,7 +191,7 @@ macro_rules! impl_buffered_source {
                 }
             }
 
-            *position += read;
+            state.offset += read;
             ReadRefResult::UpToEof(&buf[start..])
         }
 

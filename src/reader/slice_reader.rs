@@ -14,7 +14,9 @@ use crate::errors::{Error, Result};
 use crate::events::Event;
 use crate::name::QName;
 use crate::parser::Parser;
-use crate::reader::{BangType, ReadRefResult, ReadTextResult, Reader, Span, XmlSource};
+use crate::reader::{
+    BangType, ParseState, ReadRefResult, ReadTextResult, Reader, ReaderState, Span, XmlSource,
+};
 use crate::utils::is_whitespace;
 
 /// This is an implementation for reading from a `&[u8]` as underlying byte stream.
@@ -262,12 +264,16 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
     }
 
     #[inline]
-    fn read_text(&mut self, _buf: (), position: &mut u64) -> ReadTextResult<'a, ()> {
+    fn read_text(
+        &mut self,
+        _buf: (),
+        state: &mut ReaderState,
+    ) -> (Result<Event<'a>, Error>, ParseState) {
         // Search for start of markup or an entity or character reference
         match memchr::memchr2(b'<', b'&', self) {
             Some(0) if self[0] == b'<' => {
                 *self = &self[1..];
-                *position += 1;
+                state.offset += 1;
                 ReadTextResult::Markup(())
             }
             // Do not consume `&` because it may be lone and we would be need to
@@ -276,26 +282,26 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
             Some(i) if self[i] == b'<' => {
                 let bytes = &self[..i];
                 *self = &self[i + 1..];
-                *position += i as u64 + 1;
+                state.offset += i as u64 + 1;
                 ReadTextResult::UpToMarkup(bytes)
             }
             Some(i) => {
                 let (bytes, rest) = self.split_at(i);
                 *self = rest;
-                *position += i as u64;
+                state.offset += i as u64;
                 ReadTextResult::UpToRef(bytes)
             }
             None => {
                 let bytes = &self[..];
                 *self = &[];
-                *position += bytes.len() as u64;
+                state.offset += bytes.len() as u64;
                 ReadTextResult::UpToEof(bytes)
             }
         }
     }
 
     #[inline]
-    fn read_ref(&mut self, _buf: (), position: &mut u64) -> ReadRefResult<'a> {
+    fn read_ref(&mut self, _buf: (), state: &mut ReaderState) -> ReadRefResult<'a> {
         debug_assert_eq!(
             self.first(),
             Some(&b'&'),
@@ -308,7 +314,7 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
             Some(i) if self[i + 1] == b'&' => {
                 let (bytes, rest) = self.split_at(i + 1);
                 *self = rest;
-                *position += i as u64 + 1;
+                state.offset += i as u64 + 1;
 
                 ReadRefResult::UpToRef(bytes)
             }
@@ -318,7 +324,7 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
                 let bytes = &self[..end];
                 // +1 -- skip the end `;` or `<`
                 *self = &self[end + 1..];
-                *position += end as u64 + 1;
+                state.offset += end as u64 + 1;
 
                 if is_end {
                     ReadRefResult::Ref(bytes)
@@ -329,7 +335,7 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
             None => {
                 let bytes = &self[..];
                 *self = &[];
-                *position += bytes.len() as u64;
+                state.offset += bytes.len() as u64;
 
                 ReadRefResult::UpToEof(bytes)
             }

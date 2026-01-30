@@ -281,7 +281,7 @@ macro_rules! read_event_impl {
                 },
                 ParseState::InsideRef => { // Go to InsideText
                     let start = $self.state.offset;
-                    match $reader.read_ref($buf, &mut $self.state.offset) $(.$await)? {
+                    match $reader.read_ref($buf, &mut $self.state) $(.$await)? {
                         // Emit reference, go to InsideText state
                         ReadRefResult::Ref(bytes) => {
                             $self.state.state = ParseState::InsideText;
@@ -324,13 +324,12 @@ macro_rules! read_event_impl {
                         $reader.skip_whitespace(&mut $self.state.offset) $(.$await)? ?;
                     }
 
-                    match $reader.read_text($buf, &mut $self.state.offset) $(.$await)? {
+                    match $reader.read_text($buf, &mut $self.state) $(.$await)? {
                         ReadTextResult::Markup(buf) => {
                             $self.read_until_close(buf) $(.$await)?
                         }
                         ReadTextResult::Ref(buf) => {
                             $self.state.state = ParseState::InsideRef;
-                            // Return immediately to allow for tail call optimization
                             return $self.read_event_impl(buf) $(.$await)?;
                         }
                         ReadTextResult::UpToMarkup(bytes) => {
@@ -565,7 +564,7 @@ pub type Span = Range<u64>;
 ///   InsideEmpty    -- End                   --> InsideText
 ///   _ -. Eof .-> Done
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum ParseState {
     /// Initial state in which reader stay after creation. Transition from that
     /// state could produce a `Text`, `Decl`, `Comment` or `Start` event. The next
@@ -1075,7 +1074,7 @@ trait XmlSource<'r, B> {
     /// - `position`: Will be increased by amount of bytes consumed
     ///
     /// [events]: crate::events::Event
-    fn read_text(&mut self, buf: B, position: &mut u64) -> ReadTextResult<'r, B>;
+    fn read_text(&mut self, buf: B, state: &mut ReaderState) -> Result<Event<'r>, Error>;
 
     /// Read input until end of general reference (the `;`) is found, start of
     /// another general reference (the `&`) is found or end of input is reached.
@@ -1088,7 +1087,7 @@ trait XmlSource<'r, B> {
     /// - `position`: Will be increased by amount of bytes consumed
     ///
     /// [events]: crate::events::Event
-    fn read_ref(&mut self, buf: B, position: &mut u64) -> ReadRefResult<'r>;
+    fn read_ref(&mut self, buf: B, state: &mut ReaderState) -> Result<Event<'r>, Error>;
 
     /// Read input until processing instruction is finished.
     ///
@@ -1639,98 +1638,107 @@ mod test {
 
             mod read_text {
                 use super::*;
-                use crate::reader::ReadTextResult;
+                use crate::reader::{ReadTextResult, ReaderState, ParseState};
+                use crate::events::{Event};
                 use crate::utils::Bytes;
                 use pretty_assertions::assert_eq;
 
                 #[$test]
                 $($async)? fn empty() {
                     let buf = $buf;
-                    let mut position = 1;
                     let mut input = b"".as_ref();
                     //                ^= 1
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_text(buf, &mut position) $(.$await)? {
-                        ReadTextResult::UpToEof(bytes) => assert_eq!(Bytes(bytes), Bytes(b"")),
+                    match $source(&mut input).read_text(buf, &mut state) $(.$await)? {
+                        Ok(Event::Eof) => {},
                         x => panic!("Expected `UpToEof(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 1);
+                    assert_eq!(state.offset, 1);
+                    assert_eq!(state.state, ParseState::Done);
                 }
 
                 #[$test]
                 $($async)? fn markup() {
                     let buf = $buf;
-                    let mut position = 1;
-                    let mut input = b"<".as_ref();
-                    //                 ^= 2
+                    let mut input = b"<test>".as_ref();
+                    //                      ^= 7
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_text(buf, &mut position) $(.$await)? {
-                        ReadTextResult::Markup(b) => assert_eq!(b, $buf),
+                    match $source(&mut input).read_text(buf, &mut state) $(.$await)? {
+                        Ok(Event::Start(b)) => assert_eq!(b.buf.as_ref(), b"test"),
                         x => panic!("Expected `Markup(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 2);
+                    assert_eq!(state.state, ParseState::InsideText);
+                    assert_eq!(state.offset, 7);
                 }
 
                 #[$test]
                 $($async)? fn ref_() {
                     let buf = $buf;
-                    let mut position = 1;
                     let mut input = b"&".as_ref();
                     //                ^= 1
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_text(buf, &mut position) $(.$await)? {
+                    match $source(&mut input).read_text(buf, &mut state) $(.$await)? {
                         ReadTextResult::Ref(b) => assert_eq!(b, $buf),
                         x => panic!("Expected `Ref(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 1);
+                    assert_eq!(state.offset, 1);
                 }
 
                 #[$test]
                 $($async)? fn up_to_markup() {
                     let buf = $buf;
-                    let mut position = 1;
                     let mut input = b"a<".as_ref();
                     //                1 ^= 3
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_text(buf, &mut position) $(.$await)? {
+                    match $source(&mut input).read_text(buf, &mut state) $(.$await)? {
                         ReadTextResult::UpToMarkup(bytes) => assert_eq!(Bytes(bytes), Bytes(b"a")),
                         x => panic!("Expected `UpToMarkup(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 3);
+                    assert_eq!(state.offset, 3);
                 }
 
                 #[$test]
                 $($async)? fn up_to_ref() {
                     let buf = $buf;
-                    let mut position = 1;
                     let mut input = b"a&".as_ref();
                     //                 ^= 2
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_text(buf, &mut position) $(.$await)? {
+                    match $source(&mut input).read_text(buf, &mut state) $(.$await)? {
                         ReadTextResult::UpToRef(bytes) => assert_eq!(Bytes(bytes), Bytes(b"a")),
                         x => panic!("Expected `UpToRef(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 2);
+                    assert_eq!(state.offset, 2);
                 }
 
                 #[$test]
                 $($async)? fn up_to_eof() {
                     let buf = $buf;
-                    let mut position = 1;
                     let mut input = b"a".as_ref();
                     //                 ^= 2
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_text(buf, &mut position) $(.$await)? {
+                    match $source(&mut input).read_text(buf, &mut state) $(.$await)? {
                         ReadTextResult::UpToEof(bytes) => assert_eq!(Bytes(bytes), Bytes(b"a")),
                         x => panic!("Expected `UpToEof(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 2);
+                    assert_eq!(state.offset, 2);
                 }
             }
 
             mod read_ref {
                 use super::*;
-                use crate::reader::ReadRefResult;
+                use crate::reader::{ReadRefResult, ReaderState};
                 use crate::utils::Bytes;
                 use pretty_assertions::assert_eq;
 
@@ -1741,71 +1749,76 @@ mod test {
                 #[$test]
                 $($async)? fn up_to_eof() {
                     let buf = $buf;
-                    let mut position = 1;
                     let mut input = b"&".as_ref();
                     //                 ^= 2
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_ref(buf, &mut position) $(.$await)? {
+                    match $source(&mut input).read_ref(buf, &mut state) $(.$await)? {
                         ReadRefResult::UpToEof(bytes) => assert_eq!(Bytes(bytes), Bytes(b"&")),
                         x => panic!("Expected `UpToEof(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 2);
+                    assert_eq!(state.offset, 2);
                 }
 
                 #[$test]
                 $($async)? fn up_to_ref() {
                     let buf = $buf;
-                    let mut position = 1;
                     let mut input = b"&&".as_ref();
                     //                 ^= 2
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_ref(buf, &mut position) $(.$await)? {
+                    match $source(&mut input).read_ref(buf, &mut state) $(.$await)? {
                         ReadRefResult::UpToRef(bytes) => assert_eq!(Bytes(bytes), Bytes(b"&")),
                         x => panic!("Expected `UpToRef(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 2);
+                    assert_eq!(state.offset, 2);
                 }
 
                 #[$test]
                 $($async)? fn up_to_markup() {
                     let buf = $buf;
-                    let mut position = 1;
                     let mut input = b"&<".as_ref();
                     //                  ^= 3
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_ref(buf, &mut position) $(.$await)? {
+                    match $source(&mut input).read_ref(buf, &mut state) $(.$await)? {
                         ReadRefResult::UpToMarkup(bytes) => assert_eq!(Bytes(bytes), Bytes(b"&")),
                         x => panic!("Expected `UpToMarkup(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 3);
+                    assert_eq!(state.offset, 3);
                 }
 
                 #[$test]
                 $($async)? fn empty_ref() {
                     let buf = $buf;
-                    let mut position = 1;
                     let mut input = b"&;".as_ref();
                     //                  ^= 3
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_ref(buf, &mut position) $(.$await)? {
+                    match $source(&mut input).read_ref(buf, &mut state) $(.$await)? {
                         ReadRefResult::Ref(bytes) => assert_eq!(Bytes(bytes), Bytes(b"&")),
                         x => panic!("Expected `Ref(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 3);
+                    assert_eq!(state.offset, 3);
                 }
 
                 #[$test]
                 $($async)? fn normal() {
                     let buf = $buf;
-                    let mut position = 1;
                     let mut input = b"&lt;".as_ref();
                     //                    ^= 5
+                    let mut state = ReaderState::default();
+                    state.offset = 1;
 
-                    match $source(&mut input).read_ref(buf, &mut position) $(.$await)? {
+                    match $source(&mut input).read_ref(buf, &mut state) $(.$await)? {
                         ReadRefResult::Ref(bytes) => assert_eq!(Bytes(bytes), Bytes(b"&lt")),
                         x => panic!("Expected `Ref(_)`, but got `{:?}`", x),
                     }
-                    assert_eq!(position, 5);
+                    assert_eq!(state.offset, 5);
                 }
             }
 
