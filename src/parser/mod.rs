@@ -6,7 +6,7 @@ mod comment;
 mod dtd;
 mod element;
 mod pi;
-mod fast_element;   
+pub mod fast_element;   
 
 pub use comment::CommentParser;
 pub(crate) use dtd::DtdParser;

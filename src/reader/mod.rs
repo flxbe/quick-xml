@@ -1090,6 +1090,22 @@ trait XmlSource<'r, B> {
     /// [events]: crate::events::Event
     fn read_ref(&mut self, buf: B, position: &mut u64) -> ReadRefResult<'r>;
 
+    /// Read input until element declaration is finished.
+    ///
+    /// This method expect that start sequence of a parser already was read.
+    ///
+    /// Returns both the length of the name and the full content of the element.
+    /// The end of thing and the returned content is determined by the used parser.
+    ///
+    /// If input (`Self`) is exhausted and no bytes was read, or if the specified
+    /// parser could not find the ending sequence of the thing, returns `SyntaxError`.
+    ///
+    /// # Parameters
+    /// - `buf`: Buffer that could be filled from an input (`Self`) and
+    ///   from which [events] could borrow their data
+    /// - `position`: Will be increased by amount of bytes consumed
+    fn read_element(&mut self, buf: B, position: &mut u64) -> Result<(usize, &'r [u8]), Error>;
+
     /// Read input until processing instruction is finished.
     ///
     /// This method expect that start sequence of a parser already was read.

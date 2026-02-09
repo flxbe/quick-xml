@@ -1,6 +1,6 @@
 //! Contains a parser for an XML element.
 
-use crate::{errors::SyntaxError, events::attributes::Attr};
+use crate::errors::SyntaxError;
 
 /// A parser that search a `>` symbol in the slice outside of quoted regions.
 ///
@@ -45,9 +45,11 @@ pub enum FastElementParser {
     /// The initial state, inside the Tag name.
     /// Contains the current length of the tag name.
     Tag(usize),
+    /// The name fast completely parsed. Now look for the '>'.
     Attributes(usize, AttributeParser),
 }
 
+/// The internal state of the attribute parser.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttributeParser {
     /// The initial state, not within ' or ".
@@ -64,7 +66,7 @@ impl FastElementParser {
     /// Returns the length of the name and the number of consumed bytes of the current call or `None` if `>` was not found in `bytes`.
     /// A return-value of None implies, that the full butes array was consumed.
     #[inline]
-    fn feed(&mut self, bytes: &[u8]) -> Option<(usize, usize)> {
+    pub fn feed(&mut self, bytes: &[u8]) -> Option<(usize, usize)> {
         // TODO: Fix parser interface, fix tests
 
         let (name_len, mut attr_parser, offset) = 'name_len: {
@@ -112,8 +114,9 @@ impl FastElementParser {
         None
     }
 
+    /// Return the correct EOF SyntaxError based on the current internal state.
     #[inline]
-    fn eof_error(self, _content: &[u8]) -> SyntaxError {
+    pub fn eof_error(self, _content: &[u8]) -> SyntaxError {
         match self {
             Self::Tag(_) => SyntaxError::UnclosedTag,
             Self::Attributes(_, attr) => match attr {

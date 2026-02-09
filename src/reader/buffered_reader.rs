@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::errors::{Error, Result};
 use crate::events::Event;
 use crate::name::QName;
+use crate::parser::fast_element::FastElementParser;
 use crate::parser::Parser;
 use crate::reader::{BangType, ReadRefResult, ReadTextResult, Reader, Span, XmlSource};
 use crate::utils::is_whitespace;
@@ -192,6 +193,49 @@ macro_rules! impl_buffered_source {
 
             *position += read;
             ReadRefResult::UpToEof(&buf[start..])
+        }
+
+        #[inline]
+        $($async)? fn read_element<$($lf)?>(
+            &mut self,
+            buf: &'b mut Vec<u8>,
+            position: &mut u64,
+        ) -> Result<(usize, &'b [u8])> {
+            let mut parser = FastElementParser::default();
+            let mut read = 0;
+            let start = buf.len();
+            loop {
+                let available = match self $(.$reader)? .fill_buf() $(.$await)? {
+                    Ok(n) if n.is_empty() => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        *position += read;
+                        return Err(Error::Io(e.into()));
+                    }
+                };
+
+                if let Some((name_len, consumed)) = parser.feed(available) {
+                    buf.extend_from_slice(&available[..consumed]);
+
+                    // +1 for `>` which we do not include
+                    self $(.$reader)? .consume(consumed + 1);
+                    read += consumed as u64 + 1;
+
+                    *position += read;
+                    return Ok((name_len, &buf[start..]));
+                }
+
+                // The `>` symbol not yet found, continue reading
+                buf.extend_from_slice(available);
+
+                let used = available.len();
+                self $(.$reader)? .consume(used);
+                read += used as u64;
+            }
+
+            *position += read;
+            Err(Error::Syntax(parser.eof_error(&buf[start..])))
         }
 
         #[inline]

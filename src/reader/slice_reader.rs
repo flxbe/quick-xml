@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::io;
 
+use crate::parser::fast_element::FastElementParser;
 #[cfg(feature = "encoding")]
 use crate::reader::EncodingRef;
 #[cfg(feature = "encoding")]
@@ -334,6 +335,22 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
                 ReadRefResult::UpToEof(bytes)
             }
         }
+    }
+
+    #[inline]
+    fn read_element(&mut self, _buf: (), position: &mut u64) -> Result<(usize, &'a [u8])> {
+        let mut parser = FastElementParser::default();
+
+        if let Some((name_len, consumed)) = parser.feed(self) {
+            // +1 for `>` which we do not include
+            *position += consumed as u64 + 1;
+            let bytes = &self[..consumed];
+            *self = &self[consumed + 1..];
+            return Ok((name_len, bytes));
+        }
+
+        *position += self.len() as u64;
+        Err(Error::Syntax(parser.eof_error(self)))
     }
 
     #[inline]
