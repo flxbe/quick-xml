@@ -65,38 +65,43 @@ pub enum AttributeParser {
 impl FastElementParser {
     /// Returns the length of the name and the number of consumed bytes of the current call or `None` if `>` was not found in `bytes`.
     /// A return-value of None implies, that the full butes array was consumed.
+    /// Assumes, that the initial '<' or '</' are already consumed.
     #[inline]
     pub fn feed(&mut self, bytes: &[u8]) -> Option<(usize, usize)> {
-        // TODO: Fix parser interface, fix tests
+        // The number of bytes consumed in the current feed iteration.
+        let mut consumed: usize = 0;
 
-        let (name_len, mut attr_parser, offset) = 'name_len: {
+        let (name_len, mut attr_parser) = 'name_len: {
             match *self {
                 Self::Tag(name_len) => {
                     for i in 0..bytes.len() {
                         let byte = bytes[i];
-                        if matches!(byte, b' ' | b'\r' | b'\n' | b'\t') {
+
+                        if matches!(byte, b' ' | b'\r' | b'\n' | b'\t' | b'/') {
+                            // TODO(flxbe): Somehow make sure, that the only expect a '>' after the '/'.
                             let name_len = name_len + i;
                             let attr_parser = AttributeParser::Outside;
                             *self = Self::Attributes(name_len, attr_parser);
 
-                            break 'name_len (name_len, attr_parser, i);
+                            consumed += i;
+                            break 'name_len (name_len, attr_parser);
                         } else if byte == b'>' {
-                            return Some((name_len + i, i));
+                            return Some((name_len + i, consumed + i));
                         }
                     }
 
                     *self = Self::Tag(name_len + bytes.len());
                     return None;
                 }
-                Self::Attributes(name_len, attr_parser) => (name_len, attr_parser, 0),
+                Self::Attributes(name_len, attr_parser) => (name_len, attr_parser),
             }
         };
 
-        let new_data = &bytes[offset..];
+        let new_data = &bytes[consumed..];
         for i in memchr::memchr3_iter(b'>', b'\'', b'"', new_data) {
             attr_parser = match (attr_parser, new_data[i]) {
                 // only allowed to match `>` while we are in state `Outside`
-                (AttributeParser::Outside, b'>') => return Some((name_len, offset + i)),
+                (AttributeParser::Outside, b'>') => return Some((name_len, consumed + i)),
                 (AttributeParser::Outside, b'\'') => AttributeParser::SingleQ,
                 (AttributeParser::Outside, b'"') => AttributeParser::DoubleQ,
 
@@ -148,9 +153,7 @@ fn parse_all() {
     parse_input(b"tag key='value' key=\"value\">", 3);
     parse_input(b"tag>", 3);
     parse_input(b"tag />", 3);
-    // TODO: b"tag/>" is parsed as a tag name with length 4, as the "/" is included.
-    // Is this correct or not?
-    // parse_input(b"tag/>", 3);
+    parse_input(b"tag/>", 3);
 }
 
 #[test]

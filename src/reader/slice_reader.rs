@@ -403,6 +403,13 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
     fn peek_one(&mut self) -> io::Result<Option<u8>> {
         Ok(self.first().copied())
     }
+
+    #[inline]
+    fn consume_one(&mut self, position: &mut u64) -> io::Result<()> {
+        *self = &self[1..];
+        *position += 1;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

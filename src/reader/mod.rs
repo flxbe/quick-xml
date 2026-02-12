@@ -8,7 +8,7 @@ use std::ops::Range;
 use crate::encoding::Decoder;
 use crate::errors::{Error, IllFormedError, SyntaxError};
 use crate::events::{BytesRef, Event};
-use crate::parser::{DtdParser, ElementParser, Parser, PiParser};
+use crate::parser::{DtdParser, Parser, PiParser};
 use crate::reader::state::ReaderState;
 
 /// A struct that holds a parser configuration.
@@ -429,18 +429,19 @@ macro_rules! read_until_close {
             //   `</tag attr=">` and text `" >` which probably no one existing parser
             //   does. This is malformed XML, however it is tolerated by some parsers
             //   (e.g. the one used by Adobe Flash) and such documents do exist in the wild.
-            Ok(Some(b'/')) => match $reader
-                .read_with(ElementParser::Outside, $buf, &mut $self.state.offset)
-                $(.$await)?
-            {
-                Ok(bytes) => $self.state.emit_end(bytes),
-                Err(e) => {
-                    // We want to report error at `<`, but offset was increased,
-                    // so return it back (-1 for `<`)
-                    $self.state.last_error_offset = start - 1;
-                    Err(e)
-                }
-            },
+            Ok(Some(b'/')) => {
+                $reader.consume_one(&mut $self.state.offset)?;
+
+                match $reader.read_element($buf, &mut $self.state.offset)$(.$await)?
+                {
+                    Ok((name_len, bytes)) => $self.state.emit_end(name_len, bytes),
+                    Err(e) => {
+                        // We want to report error at `<`, but offset was increased,
+                        // so return it back (-1 for `<`)
+                        $self.state.last_error_offset = start - 1;
+                        Err(e)
+                    }
+            }},
             // `<?` - processing instruction
             Ok(Some(b'?')) => match $reader
                 .read_with(PiParser(false), $buf, &mut $self.state.offset)
@@ -455,11 +456,9 @@ macro_rules! read_until_close {
                 }
             },
             // `<...` - opening or self-closed tag
-            Ok(Some(_)) => match $reader
-                .read_with(ElementParser::Outside, $buf, &mut $self.state.offset)
-                $(.$await)?
+            Ok(Some(_)) => match $reader.read_element($buf, &mut $self.state.offset)$(.$await)?
             {
-                Ok(bytes) => Ok($self.state.emit_start(bytes)),
+                Ok((name_len, bytes)) => Ok($self.state.emit_start(name_len, bytes)),
                 Err(e) => {
                     // We want to report error at `<`, but offset was increased,
                     // so return it back (-1 for `<`)
@@ -1160,6 +1159,9 @@ trait XmlSource<'r, B> {
     /// Return one character without consuming it, so that future `read_*` calls
     /// will still include it. On EOF, return `None`.
     fn peek_one(&mut self) -> io::Result<Option<u8>>;
+
+    /// Consume one character. On EOF, return an error.
+    fn consume_one(&mut self, position: &mut u64) -> io::Result<()>;
 }
 
 /// Possible elements started with `<!`

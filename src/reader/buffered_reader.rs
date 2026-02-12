@@ -362,6 +362,13 @@ macro_rules! impl_buffered_source {
                 };
             }
         }
+
+        #[inline]
+        $($async)? fn consume_one(&mut self, position: &mut u64) -> io::Result<()> {
+            self $(.$reader)? .consume(1);
+            *position += 1;
+            Ok(())
+        }
     };
 }
 
