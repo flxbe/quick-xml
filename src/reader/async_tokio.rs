@@ -11,11 +11,369 @@ use crate::errors::{Error, IllFormedError, Result, SyntaxError};
 use crate::events::{BytesRef, Event};
 use crate::name::{QName, ResolveResult};
 use crate::parser::{ElementParser, Parser, PiParser};
-use crate::reader::buffered_reader::impl_buffered_source;
 use crate::reader::{
     BangType, BinaryStream, NsReader, ParseState, ReadRefResult, ReadTextResult, Reader, Span,
 };
 use crate::utils::is_whitespace;
+
+macro_rules! impl_buffered_source {
+    ($($lf:lifetime, $reader:tt, $async:ident, $await:ident)?) => {
+        #[cfg(not(feature = "encoding"))]
+        #[inline]
+        $($async)? fn remove_utf8_bom(&mut self) -> io::Result<()> {
+            use crate::encoding::UTF8_BOM;
+
+            loop {
+                break match self $(.$reader)? .fill_buf() $(.$await)? {
+                    Ok(n) => {
+                        if n.starts_with(UTF8_BOM) {
+                            self $(.$reader)? .consume(UTF8_BOM.len());
+                        }
+                        Ok(())
+                    },
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => Err(e),
+                };
+            }
+        }
+
+        #[cfg(feature = "encoding")]
+        #[inline]
+        $($async)? fn detect_encoding(&mut self) -> io::Result<Option<&'static encoding_rs::Encoding>> {
+            loop {
+                break match self $(.$reader)? .fill_buf() $(.$await)? {
+                    Ok(n) => if let Some((enc, bom_len)) = crate::encoding::detect_encoding(n) {
+                        self $(.$reader)? .consume(bom_len);
+                        Ok(Some(enc))
+                    } else {
+                        Ok(None)
+                    },
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => Err(e),
+                };
+            }
+        }
+
+        #[inline]
+        $($async)? fn read_text $(<$lf>)? (
+            &mut self,
+            buf: &'b mut Vec<u8>,
+            position: &mut u64,
+        ) -> ReadTextResult<'b, &'b mut Vec<u8>> {
+            let mut read = 0;
+            let start = buf.len();
+            loop {
+                let available = match self $(.$reader)? .fill_buf() $(.$await)? {
+                    Ok(n) if n.is_empty() => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        *position += read;
+                        return ReadTextResult::Err(e);
+                    }
+                };
+
+                // Search for start of markup or an entity or character reference
+                match memchr::memchr2(b'<', b'&', available) {
+                    // Special handling is needed only on the first iteration.
+                    // On next iterations we already read something and should emit Text event
+                    Some(0) if read == 0 && available[0] == b'<' => {
+                        self $(.$reader)? .consume(1);
+                        *position += 1;
+                        return ReadTextResult::Markup(buf);
+                    }
+                    // Do not consume `&` because it may be lone and we would be need to
+                    // return it as part of Text event
+                    Some(0) if read == 0 => return ReadTextResult::Ref(buf),
+                    Some(i) if available[i] == b'<' => {
+                        buf.extend_from_slice(&available[..i]);
+
+                        // +1 to skip `<`
+                        let used = i + 1;
+                        self $(.$reader)? .consume(used);
+                        read += used as u64;
+
+                        *position += read;
+                        return ReadTextResult::UpToMarkup(&buf[start..]);
+                    }
+                    Some(i) => {
+                        buf.extend_from_slice(&available[..i]);
+
+                        self $(.$reader)? .consume(i);
+                        read += i as u64;
+
+                        *position += read;
+                        return ReadTextResult::UpToRef(&buf[start..]);
+                    }
+                    None => {
+                        buf.extend_from_slice(available);
+
+                        let used = available.len();
+                        self $(.$reader)? .consume(used);
+                        read += used as u64;
+                    }
+                }
+            }
+
+            *position += read;
+            ReadTextResult::UpToEof(&buf[start..])
+        }
+
+        #[inline]
+        $($async)? fn read_ref $(<$lf>)? (
+            &mut self,
+            buf: &'b mut Vec<u8>,
+            position: &mut u64,
+        ) -> ReadRefResult<'b> {
+            let mut read = 0;
+            let start = buf.len();
+            loop {
+                let available = match self $(.$reader)? .fill_buf() $(.$await)? {
+                    Ok(n) if n.is_empty() => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        *position += read;
+                        return ReadRefResult::Err(e);
+                    }
+                };
+                // `read_ref` called when the first character is `&`, so we
+                // should explicitly skip it at first iteration lest we confuse
+                // it with the end
+                if read == 0 {
+                    debug_assert_eq!(
+                        available.first(),
+                        Some(&b'&'),
+                        "`read_ref` must be called at `&`"
+                    );
+                    // If that ampersand is lone, then it will be part of text
+                    // and we should keep it
+                    buf.push(b'&');
+                    self $(.$reader)? .consume(1);
+                    read += 1;
+                    continue;
+                }
+
+                match memchr::memchr3(b';', b'&', b'<', available) {
+                    // Do not consume `&` because it may be lone and we would be need to
+                    // return it as part of Text event
+                    Some(i) if available[i] == b'&' => {
+                        buf.extend_from_slice(&available[..i]);
+
+                        self $(.$reader)? .consume(i);
+                        read += i as u64;
+
+                        *position += read;
+
+                        return ReadRefResult::UpToRef(&buf[start..]);
+                    }
+                    Some(i) => {
+                        let is_end = available[i] == b';';
+                        buf.extend_from_slice(&available[..i]);
+
+                        // +1 -- skip the end `;` or `<`
+                        let used = i + 1;
+                        self $(.$reader)? .consume(used);
+                        read += used as u64;
+
+                        *position += read;
+
+                        return if is_end {
+                            ReadRefResult::Ref(&buf[start..])
+                        } else {
+                            ReadRefResult::UpToMarkup(&buf[start..])
+                        };
+                    }
+                    None => {
+                        buf.extend_from_slice(available);
+
+                        let used = available.len();
+                        self $(.$reader)? .consume(used);
+                        read += used as u64;
+                    }
+                }
+            }
+
+            *position += read;
+            ReadRefResult::UpToEof(&buf[start..])
+        }
+
+        #[inline]
+        $($async)? fn read_element<$($lf)?>(
+            &mut self,
+            buf: &'b mut Vec<u8>,
+            position: &mut u64,
+        ) -> Result<(usize, &'b [u8])> {
+            let mut parser = FastElementParser::default();
+            let mut read = 0;
+            let start = buf.len();
+            loop {
+                let available = match self $(.$reader)? .fill_buf() $(.$await)? {
+                    Ok(n) if n.is_empty() => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        *position += read;
+                        return Err(Error::Io(e.into()));
+                    }
+                };
+
+                if let Some((name_len, consumed)) = parser.feed(available) {
+                    buf.extend_from_slice(&available[..consumed]);
+
+                    // +1 for `>` which we do not include
+                    self $(.$reader)? .consume(consumed + 1);
+                    read += consumed as u64 + 1;
+
+                    *position += read;
+                    return Ok((name_len, &buf[start..]));
+                }
+
+                // The `>` symbol not yet found, continue reading
+                buf.extend_from_slice(available);
+
+                let used = available.len();
+                self $(.$reader)? .consume(used);
+                read += used as u64;
+            }
+
+            *position += read;
+            Err(Error::Syntax(parser.eof_error(&buf[start..])))
+        }
+
+        #[inline]
+        $($async)? fn read_with<$($lf,)? P: Parser>(
+            &mut self,
+            mut parser: P,
+            buf: &'b mut Vec<u8>,
+            position: &mut u64,
+        ) -> Result<&'b [u8]> {
+            let mut read = 0;
+            let start = buf.len();
+            loop {
+                let available = match self $(.$reader)? .fill_buf() $(.$await)? {
+                    Ok(n) if n.is_empty() => break,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        *position += read;
+                        return Err(Error::Io(e.into()));
+                    }
+                };
+
+                if let Some(i) = parser.feed(available) {
+                    buf.extend_from_slice(&available[..i]);
+
+                    // +1 for `>` which we do not include
+                    self $(.$reader)? .consume(i + 1);
+                    read += i as u64 + 1;
+
+                    *position += read;
+                    return Ok(&buf[start..]);
+                }
+
+                // The `>` symbol not yet found, continue reading
+                buf.extend_from_slice(available);
+
+                let used = available.len();
+                self $(.$reader)? .consume(used);
+                read += used as u64;
+            }
+
+            *position += read;
+            Err(Error::Syntax(parser.eof_error(&buf[start..])))
+        }
+
+        #[inline]
+        $($async)? fn read_bang_element $(<$lf>)? (
+            &mut self,
+            buf: &'b mut Vec<u8>,
+            position: &mut u64,
+        ) -> Result<(BangType, &'b [u8])> {
+            // Peeked one bang ('!') before being called, so it's guaranteed to
+            // start with it.
+            let start = buf.len();
+            let mut read = 1;
+            buf.push(b'!');
+            self $(.$reader)? .consume(1);
+
+            let mut bang_type = BangType::new(self.peek_one() $(.$await)? ?)?;
+
+            loop {
+                match self $(.$reader)? .fill_buf() $(.$await)? {
+                    // Note: Do not update position, so the error points to
+                    // somewhere sane rather than at the EOF
+                    Ok(n) if n.is_empty() => break,
+                    Ok(available) => {
+                        // We only parse from start because we don't want to consider
+                        // whatever is in the buffer before the bang element
+                        if let Some((consumed, used)) = bang_type.parse(&buf[start..], available) {
+                            buf.extend_from_slice(consumed);
+
+                            self $(.$reader)? .consume(used);
+                            read += used as u64;
+
+                            *position += read;
+                            return Ok((bang_type, &buf[start..]));
+                        } else {
+                            buf.extend_from_slice(available);
+
+                            let used = available.len();
+                            self $(.$reader)? .consume(used);
+                            read += used as u64;
+                        }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        *position += read;
+                        return Err(Error::Io(e.into()));
+                    }
+                }
+            }
+
+            *position += read;
+            Err(bang_type.to_err().into())
+        }
+
+        #[inline]
+        $($async)? fn skip_whitespace(&mut self, position: &mut u64) -> io::Result<()> {
+            loop {
+                break match self $(.$reader)? .fill_buf() $(.$await)? {
+                    Ok(n) => {
+                        let count = n.iter().position(|b| !is_whitespace(*b)).unwrap_or(n.len());
+                        if count > 0 {
+                            self $(.$reader)? .consume(count);
+                            *position += count as u64;
+                            continue;
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => Err(e),
+                };
+            }
+        }
+
+        #[inline]
+        $($async)? fn peek_one(&mut self) -> io::Result<Option<u8>> {
+            loop {
+                break match self $(.$reader)? .fill_buf() $(.$await)? {
+                    Ok(n) => Ok(n.first().cloned()),
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => Err(e),
+                };
+            }
+        }
+
+        #[inline]
+        $($async)? fn consume_one(&mut self, position: &mut u64) -> io::Result<()> {
+            self $(.$reader)? .consume(1);
+            *position += 1;
+            Ok(())
+        }
+    };
+}
 
 /// A struct for read XML asynchronously from an [`AsyncBufRead`].
 ///

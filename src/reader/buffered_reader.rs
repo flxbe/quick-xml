@@ -5,384 +5,369 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
-use crate::errors::{Error, Result};
-use crate::events::Event;
+use crate::errors::{Error, IllFormedError, Result, SyntaxError};
+use crate::events::{BytesRef, Event};
 use crate::name::QName;
 use crate::parser::fast_element::FastElementParser;
-use crate::parser::Parser;
-use crate::reader::{BangType, ReadRefResult, ReadTextResult, Reader, Span, XmlSource};
+use crate::parser::{Parser, PiParser};
+use crate::reader::{BangType, ParseState, ReadRefResult, ReadTextResult, Reader, Span};
 use crate::utils::is_whitespace;
 
-macro_rules! impl_buffered_source {
-    ($($lf:lifetime, $reader:tt, $async:ident, $await:ident)?) => {
-        #[cfg(not(feature = "encoding"))]
-        #[inline]
-        $($async)? fn remove_utf8_bom(&mut self) -> io::Result<()> {
-            use crate::encoding::UTF8_BOM;
+#[cfg(not(feature = "encoding"))]
+#[inline]
+fn remove_utf8_bom<R: BufRead>(r: &mut R) -> io::Result<()> {
+    use crate::encoding::UTF8_BOM;
 
-            loop {
-                break match self $(.$reader)? .fill_buf() $(.$await)? {
-                    Ok(n) => {
-                        if n.starts_with(UTF8_BOM) {
-                            self $(.$reader)? .consume(UTF8_BOM.len());
-                        }
-                        Ok(())
-                    },
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => Err(e),
-                };
-            }
-        }
-
-        #[cfg(feature = "encoding")]
-        #[inline]
-        $($async)? fn detect_encoding(&mut self) -> io::Result<Option<&'static encoding_rs::Encoding>> {
-            loop {
-                break match self $(.$reader)? .fill_buf() $(.$await)? {
-                    Ok(n) => if let Some((enc, bom_len)) = crate::encoding::detect_encoding(n) {
-                        self $(.$reader)? .consume(bom_len);
-                        Ok(Some(enc))
-                    } else {
-                        Ok(None)
-                    },
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => Err(e),
-                };
-            }
-        }
-
-        #[inline]
-        $($async)? fn read_text $(<$lf>)? (
-            &mut self,
-            buf: &'b mut Vec<u8>,
-            position: &mut u64,
-        ) -> ReadTextResult<'b, &'b mut Vec<u8>> {
-            let mut read = 0;
-            let start = buf.len();
-            loop {
-                let available = match self $(.$reader)? .fill_buf() $(.$await)? {
-                    Ok(n) if n.is_empty() => break,
-                    Ok(n) => n,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        *position += read;
-                        return ReadTextResult::Err(e);
-                    }
-                };
-
-                // Search for start of markup or an entity or character reference
-                match memchr::memchr2(b'<', b'&', available) {
-                    // Special handling is needed only on the first iteration.
-                    // On next iterations we already read something and should emit Text event
-                    Some(0) if read == 0 && available[0] == b'<' => {
-                        self $(.$reader)? .consume(1);
-                        *position += 1;
-                        return ReadTextResult::Markup(buf);
-                    }
-                    // Do not consume `&` because it may be lone and we would be need to
-                    // return it as part of Text event
-                    Some(0) if read == 0 => return ReadTextResult::Ref(buf),
-                    Some(i) if available[i] == b'<' => {
-                        buf.extend_from_slice(&available[..i]);
-
-                        // +1 to skip `<`
-                        let used = i + 1;
-                        self $(.$reader)? .consume(used);
-                        read += used as u64;
-
-                        *position += read;
-                        return ReadTextResult::UpToMarkup(&buf[start..]);
-                    }
-                    Some(i) => {
-                        buf.extend_from_slice(&available[..i]);
-
-                        self $(.$reader)? .consume(i);
-                        read += i as u64;
-
-                        *position += read;
-                        return ReadTextResult::UpToRef(&buf[start..]);
-                    }
-                    None => {
-                        buf.extend_from_slice(available);
-
-                        let used = available.len();
-                        self $(.$reader)? .consume(used);
-                        read += used as u64;
-                    }
+    loop {
+        break match r.fill_buf() {
+            Ok(n) => {
+                if n.starts_with(UTF8_BOM) {
+                    r.consume(UTF8_BOM.len());
                 }
+                Ok(())
             }
-
-            *position += read;
-            ReadTextResult::UpToEof(&buf[start..])
-        }
-
-        #[inline]
-        $($async)? fn read_ref $(<$lf>)? (
-            &mut self,
-            buf: &'b mut Vec<u8>,
-            position: &mut u64,
-        ) -> ReadRefResult<'b> {
-            let mut read = 0;
-            let start = buf.len();
-            loop {
-                let available = match self $(.$reader)? .fill_buf() $(.$await)? {
-                    Ok(n) if n.is_empty() => break,
-                    Ok(n) => n,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        *position += read;
-                        return ReadRefResult::Err(e);
-                    }
-                };
-                // `read_ref` called when the first character is `&`, so we
-                // should explicitly skip it at first iteration lest we confuse
-                // it with the end
-                if read == 0 {
-                    debug_assert_eq!(
-                        available.first(),
-                        Some(&b'&'),
-                        "`read_ref` must be called at `&`"
-                    );
-                    // If that ampersand is lone, then it will be part of text
-                    // and we should keep it
-                    buf.push(b'&');
-                    self $(.$reader)? .consume(1);
-                    read += 1;
-                    continue;
-                }
-
-                match memchr::memchr3(b';', b'&', b'<', available) {
-                    // Do not consume `&` because it may be lone and we would be need to
-                    // return it as part of Text event
-                    Some(i) if available[i] == b'&' => {
-                        buf.extend_from_slice(&available[..i]);
-
-                        self $(.$reader)? .consume(i);
-                        read += i as u64;
-
-                        *position += read;
-
-                        return ReadRefResult::UpToRef(&buf[start..]);
-                    }
-                    Some(i) => {
-                        let is_end = available[i] == b';';
-                        buf.extend_from_slice(&available[..i]);
-
-                        // +1 -- skip the end `;` or `<`
-                        let used = i + 1;
-                        self $(.$reader)? .consume(used);
-                        read += used as u64;
-
-                        *position += read;
-
-                        return if is_end {
-                            ReadRefResult::Ref(&buf[start..])
-                        } else {
-                            ReadRefResult::UpToMarkup(&buf[start..])
-                        };
-                    }
-                    None => {
-                        buf.extend_from_slice(available);
-
-                        let used = available.len();
-                        self $(.$reader)? .consume(used);
-                        read += used as u64;
-                    }
-                }
-            }
-
-            *position += read;
-            ReadRefResult::UpToEof(&buf[start..])
-        }
-
-        #[inline]
-        $($async)? fn read_element<$($lf)?>(
-            &mut self,
-            buf: &'b mut Vec<u8>,
-            position: &mut u64,
-        ) -> Result<(usize, &'b [u8])> {
-            let mut parser = FastElementParser::default();
-            let mut read = 0;
-            let start = buf.len();
-            loop {
-                let available = match self $(.$reader)? .fill_buf() $(.$await)? {
-                    Ok(n) if n.is_empty() => break,
-                    Ok(n) => n,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        *position += read;
-                        return Err(Error::Io(e.into()));
-                    }
-                };
-
-                if let Some((name_len, consumed)) = parser.feed(available) {
-                    buf.extend_from_slice(&available[..consumed]);
-
-                    // +1 for `>` which we do not include
-                    self $(.$reader)? .consume(consumed + 1);
-                    read += consumed as u64 + 1;
-
-                    *position += read;
-                    return Ok((name_len, &buf[start..]));
-                }
-
-                // The `>` symbol not yet found, continue reading
-                buf.extend_from_slice(available);
-
-                let used = available.len();
-                self $(.$reader)? .consume(used);
-                read += used as u64;
-            }
-
-            *position += read;
-            Err(Error::Syntax(parser.eof_error(&buf[start..])))
-        }
-
-        #[inline]
-        $($async)? fn read_with<$($lf,)? P: Parser>(
-            &mut self,
-            mut parser: P,
-            buf: &'b mut Vec<u8>,
-            position: &mut u64,
-        ) -> Result<&'b [u8]> {
-            let mut read = 0;
-            let start = buf.len();
-            loop {
-                let available = match self $(.$reader)? .fill_buf() $(.$await)? {
-                    Ok(n) if n.is_empty() => break,
-                    Ok(n) => n,
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        *position += read;
-                        return Err(Error::Io(e.into()));
-                    }
-                };
-
-                if let Some(i) = parser.feed(available) {
-                    buf.extend_from_slice(&available[..i]);
-
-                    // +1 for `>` which we do not include
-                    self $(.$reader)? .consume(i + 1);
-                    read += i as u64 + 1;
-
-                    *position += read;
-                    return Ok(&buf[start..]);
-                }
-
-                // The `>` symbol not yet found, continue reading
-                buf.extend_from_slice(available);
-
-                let used = available.len();
-                self $(.$reader)? .consume(used);
-                read += used as u64;
-            }
-
-            *position += read;
-            Err(Error::Syntax(parser.eof_error(&buf[start..])))
-        }
-
-        #[inline]
-        $($async)? fn read_bang_element $(<$lf>)? (
-            &mut self,
-            buf: &'b mut Vec<u8>,
-            position: &mut u64,
-        ) -> Result<(BangType, &'b [u8])> {
-            // Peeked one bang ('!') before being called, so it's guaranteed to
-            // start with it.
-            let start = buf.len();
-            let mut read = 1;
-            buf.push(b'!');
-            self $(.$reader)? .consume(1);
-
-            let mut bang_type = BangType::new(self.peek_one() $(.$await)? ?)?;
-
-            loop {
-                match self $(.$reader)? .fill_buf() $(.$await)? {
-                    // Note: Do not update position, so the error points to
-                    // somewhere sane rather than at the EOF
-                    Ok(n) if n.is_empty() => break,
-                    Ok(available) => {
-                        // We only parse from start because we don't want to consider
-                        // whatever is in the buffer before the bang element
-                        if let Some((consumed, used)) = bang_type.parse(&buf[start..], available) {
-                            buf.extend_from_slice(consumed);
-
-                            self $(.$reader)? .consume(used);
-                            read += used as u64;
-
-                            *position += read;
-                            return Ok((bang_type, &buf[start..]));
-                        } else {
-                            buf.extend_from_slice(available);
-
-                            let used = available.len();
-                            self $(.$reader)? .consume(used);
-                            read += used as u64;
-                        }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        *position += read;
-                        return Err(Error::Io(e.into()));
-                    }
-                }
-            }
-
-            *position += read;
-            Err(bang_type.to_err().into())
-        }
-
-        #[inline]
-        $($async)? fn skip_whitespace(&mut self, position: &mut u64) -> io::Result<()> {
-            loop {
-                break match self $(.$reader)? .fill_buf() $(.$await)? {
-                    Ok(n) => {
-                        let count = n.iter().position(|b| !is_whitespace(*b)).unwrap_or(n.len());
-                        if count > 0 {
-                            self $(.$reader)? .consume(count);
-                            *position += count as u64;
-                            continue;
-                        } else {
-                            Ok(())
-                        }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => Err(e),
-                };
-            }
-        }
-
-        #[inline]
-        $($async)? fn peek_one(&mut self) -> io::Result<Option<u8>> {
-            loop {
-                break match self $(.$reader)? .fill_buf() $(.$await)? {
-                    Ok(n) => Ok(n.first().cloned()),
-                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => Err(e),
-                };
-            }
-        }
-
-        #[inline]
-        $($async)? fn consume_one(&mut self, position: &mut u64) -> io::Result<()> {
-            self $(.$reader)? .consume(1);
-            *position += 1;
-            Ok(())
-        }
-    };
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => Err(e),
+        };
+    }
 }
 
-// Make it public for use in async implementations.
-// New rustc reports
-// > warning: the item `impl_buffered_source` is imported redundantly
-// so make it public only when async feature is enabled
-#[cfg(feature = "async-tokio")]
-pub(super) use impl_buffered_source;
+#[cfg(feature = "encoding")]
+#[inline]
+fn detect_encoding<R: BufRead>(r: &mut R) -> io::Result<Option<&'static encoding_rs::Encoding>> {
+    loop {
+        break match r.fill_buf() {
+            Ok(n) => {
+                if let Some((enc, bom_len)) = crate::encoding::detect_encoding(n) {
+                    r.consume(bom_len);
+                    Ok(Some(enc))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => Err(e),
+        };
+    }
+}
 
-/// Implementation of `XmlSource` for any `BufRead` reader using a user-given
-/// `Vec<u8>` as buffer that will be borrowed by events.
-impl<'b, R: BufRead> XmlSource<'b, &'b mut Vec<u8>> for R {
-    impl_buffered_source!();
+#[inline]
+fn read_text<'b, R: BufRead>(
+    r: &mut R,
+    buf: &'b mut Vec<u8>,
+    position: &mut u64,
+) -> ReadTextResult<'b, &'b mut Vec<u8>> {
+    let mut read = 0;
+    let start = buf.len();
+    loop {
+        let available = match r.fill_buf() {
+            Ok(n) if n.is_empty() => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                *position += read;
+                return ReadTextResult::Err(e);
+            }
+        };
+
+        // Search for start of markup or an entity or character reference
+        match memchr::memchr2(b'<', b'&', available) {
+            // Special handling is needed only on the first iteration.
+            // On next iterations we already read something and should emit Text event
+            Some(0) if read == 0 && available[0] == b'<' => {
+                r.consume(1);
+                *position += 1;
+                return ReadTextResult::Markup(buf);
+            }
+            // Do not consume `&` because it may be lone and we would be need to
+            // return it as part of Text event
+            Some(0) if read == 0 => return ReadTextResult::Ref(buf),
+            Some(i) if available[i] == b'<' => {
+                buf.extend_from_slice(&available[..i]);
+
+                // +1 to skip `<`
+                let used = i + 1;
+                r.consume(used);
+                read += used as u64;
+
+                *position += read;
+                return ReadTextResult::UpToMarkup(&buf[start..]);
+            }
+            Some(i) => {
+                buf.extend_from_slice(&available[..i]);
+
+                r.consume(i);
+                read += i as u64;
+
+                *position += read;
+                return ReadTextResult::UpToRef(&buf[start..]);
+            }
+            None => {
+                buf.extend_from_slice(available);
+
+                let used = available.len();
+                r.consume(used);
+                read += used as u64;
+            }
+        }
+    }
+
+    *position += read;
+    ReadTextResult::UpToEof(&buf[start..])
+}
+
+#[inline]
+fn read_ref<'b, R: BufRead>(
+    r: &mut R,
+    buf: &'b mut Vec<u8>,
+    position: &mut u64,
+) -> ReadRefResult<'b> {
+    let mut read = 0;
+    let start = buf.len();
+    loop {
+        let available = match r.fill_buf() {
+            Ok(n) if n.is_empty() => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                *position += read;
+                return ReadRefResult::Err(e);
+            }
+        };
+        // `read_ref` called when the first character is `&`, so we
+        // should explicitly skip it at first iteration lest we confuse
+        // it with the end
+        if read == 0 {
+            debug_assert_eq!(
+                available.first(),
+                Some(&b'&'),
+                "`read_ref` must be called at `&`"
+            );
+            // If that ampersand is lone, then it will be part of text
+            // and we should keep it
+            buf.push(b'&');
+            r.consume(1);
+            read += 1;
+            continue;
+        }
+
+        match memchr::memchr3(b';', b'&', b'<', available) {
+            // Do not consume `&` because it may be lone and we would be need to
+            // return it as part of Text event
+            Some(i) if available[i] == b'&' => {
+                buf.extend_from_slice(&available[..i]);
+
+                r.consume(i);
+                read += i as u64;
+
+                *position += read;
+
+                return ReadRefResult::UpToRef(&buf[start..]);
+            }
+            Some(i) => {
+                let is_end = available[i] == b';';
+                buf.extend_from_slice(&available[..i]);
+
+                // +1 -- skip the end `;` or `<`
+                let used = i + 1;
+                r.consume(used);
+                read += used as u64;
+
+                *position += read;
+
+                return if is_end {
+                    ReadRefResult::Ref(&buf[start..])
+                } else {
+                    ReadRefResult::UpToMarkup(&buf[start..])
+                };
+            }
+            None => {
+                buf.extend_from_slice(available);
+
+                let used = available.len();
+                r.consume(used);
+                read += used as u64;
+            }
+        }
+    }
+
+    *position += read;
+    ReadRefResult::UpToEof(&buf[start..])
+}
+
+#[inline]
+fn read_element<'b, R: BufRead>(
+    r: &mut R,
+    buf: &'b mut Vec<u8>,
+    position: &mut u64,
+) -> Result<(usize, &'b [u8])> {
+    let mut parser = FastElementParser::default();
+    let mut read = 0;
+    let start = buf.len();
+    loop {
+        let available = match r.fill_buf() {
+            Ok(n) if n.is_empty() => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                *position += read;
+                return Err(Error::Io(e.into()));
+            }
+        };
+
+        if let Some((name_len, consumed)) = parser.feed(available) {
+            buf.extend_from_slice(&available[..consumed]);
+
+            // +1 for `>` which we do not include
+            r.consume(consumed + 1);
+            read += consumed as u64 + 1;
+
+            *position += read;
+            return Ok((name_len, &buf[start..]));
+        }
+
+        // The `>` symbol not yet found, continue reading
+        buf.extend_from_slice(available);
+
+        let used = available.len();
+        r.consume(used);
+        read += used as u64;
+    }
+
+    *position += read;
+    Err(Error::Syntax(parser.eof_error(&buf[start..])))
+}
+
+#[inline]
+fn read_with<'b, R: BufRead, P: Parser>(
+    r: &mut R,
+    mut parser: P,
+    buf: &'b mut Vec<u8>,
+    position: &mut u64,
+) -> Result<&'b [u8]> {
+    let mut read = 0;
+    let start = buf.len();
+    loop {
+        let available = match r.fill_buf() {
+            Ok(n) if n.is_empty() => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                *position += read;
+                return Err(Error::Io(e.into()));
+            }
+        };
+
+        if let Some(i) = parser.feed(available) {
+            buf.extend_from_slice(&available[..i]);
+
+            // +1 for `>` which we do not include
+            r.consume(i + 1);
+            read += i as u64 + 1;
+
+            *position += read;
+            return Ok(&buf[start..]);
+        }
+
+        // The `>` symbol not yet found, continue reading
+        buf.extend_from_slice(available);
+
+        let used = available.len();
+        r.consume(used);
+        read += used as u64;
+    }
+
+    *position += read;
+    Err(Error::Syntax(parser.eof_error(&buf[start..])))
+}
+
+#[inline]
+fn read_bang_element<'b, R: BufRead>(
+    r: &mut R,
+    buf: &'b mut Vec<u8>,
+    position: &mut u64,
+) -> Result<(BangType, &'b [u8])> {
+    // Peeked one bang ('!') before being called, so it's guaranteed to
+    // start with it.
+    let start = buf.len();
+    let mut read = 1;
+    buf.push(b'!');
+    r.consume(1);
+
+    let mut bang_type = BangType::new(peek_one(r)?)?;
+
+    loop {
+        match r.fill_buf() {
+            // Note: Do not update position, so the error points to
+            // somewhere sane rather than at the EOF
+            Ok(n) if n.is_empty() => break,
+            Ok(available) => {
+                // We only parse from start because we don't want to consider
+                // whatever is in the buffer before the bang element
+                if let Some((consumed, used)) = bang_type.parse(&buf[start..], available) {
+                    buf.extend_from_slice(consumed);
+
+                    r.consume(used);
+                    read += used as u64;
+
+                    *position += read;
+                    return Ok((bang_type, &buf[start..]));
+                } else {
+                    buf.extend_from_slice(available);
+
+                    let used = available.len();
+                    r.consume(used);
+                    read += used as u64;
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                *position += read;
+                return Err(Error::Io(e.into()));
+            }
+        }
+    }
+
+    *position += read;
+    Err(bang_type.to_err().into())
+}
+
+#[inline]
+fn skip_whitespace<R: BufRead>(r: &mut R, position: &mut u64) -> io::Result<()> {
+    loop {
+        break match r.fill_buf() {
+            Ok(n) => {
+                let count = n.iter().position(|b| !is_whitespace(*b)).unwrap_or(n.len());
+                if count > 0 {
+                    r.consume(count);
+                    *position += count as u64;
+                    continue;
+                } else {
+                    Ok(())
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => Err(e),
+        };
+    }
+}
+
+#[inline]
+fn peek_one<R: BufRead>(r: &mut R) -> io::Result<Option<u8>> {
+    loop {
+        break match r.fill_buf() {
+            Ok(n) => Ok(n.first().cloned()),
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => Err(e),
+        };
+    }
+}
+
+#[inline]
+fn consume_one<R: BufRead>(r: &mut R, position: &mut u64) -> io::Result<()> {
+    r.consume(1);
+    *position += 1;
+    Ok(())
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -435,7 +420,206 @@ impl<R: BufRead> Reader<R> {
     /// ```
     #[inline]
     pub fn read_event_into<'b>(&mut self, buf: &'b mut Vec<u8>) -> Result<Event<'b>> {
-        self.read_event_impl(buf)
+        let event = match self.state.state {
+            ParseState::Init => {
+                // Go to InsideText state
+                // If encoding set explicitly, we not need to detect it. For example,
+                // explicit UTF-8 set automatically if Reader was created using `from_str`.
+                // But we still need to remove BOM for consistency with no encoding
+                // feature enabled path
+                #[cfg(feature = "encoding")]
+                if let Some(encoding) = self.reader.detect_encoding()? {
+                    if self.state.encoding.can_be_refined() {
+                        self.state.encoding = crate::reader::EncodingRef::BomDetected(encoding);
+                    }
+                }
+
+                // Removes UTF-8 BOM if it is present
+                #[cfg(not(feature = "encoding"))]
+                remove_utf8_bom(&mut self.reader);
+
+                self.state.state = ParseState::InsideText;
+
+                // Return directly to enable tail call optimization.
+                return self.read_event_into(buf);
+            }
+            ParseState::InsideRef => {
+                // Go to InsideText
+                let start = self.state.offset;
+                match read_ref(&mut self.reader, buf, &mut self.state.offset) {
+                    // Emit reference, go to InsideText state
+                    ReadRefResult::Ref(bytes) => {
+                        self.state.state = ParseState::InsideText;
+                        // +1 to skip start `&`
+                        Ok(Event::GeneralRef(BytesRef::wrap(
+                            &bytes[1..],
+                            self.decoder(),
+                        )))
+                    }
+                    // Go to Done state
+                    ReadRefResult::UpToEof(bytes) if self.state.config.allow_dangling_amp => {
+                        self.state.state = ParseState::Done;
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    }
+                    ReadRefResult::UpToEof(_) => {
+                        self.state.state = ParseState::Done;
+                        self.state.last_error_offset = start;
+                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
+                    }
+                    // Do not change state, stay in InsideRef
+                    ReadRefResult::UpToRef(bytes) if self.state.config.allow_dangling_amp => {
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    }
+                    ReadRefResult::UpToRef(_) => {
+                        self.state.last_error_offset = start;
+                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
+                    }
+                    // Go to InsideMarkup state
+                    ReadRefResult::UpToMarkup(bytes) if self.state.config.allow_dangling_amp => {
+                        self.state.state = ParseState::InsideMarkup;
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    }
+                    ReadRefResult::UpToMarkup(_) => {
+                        self.state.state = ParseState::InsideMarkup;
+                        self.state.last_error_offset = start;
+                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
+                    }
+                    ReadRefResult::Err(e) => Err(Error::Io(e.into())),
+                }
+            }
+            ParseState::InsideText => {
+                // Go to InsideMarkup or Done state
+                if self.state.config.trim_text_start {
+                    skip_whitespace(&mut self.reader, &mut self.state.offset)?;
+                }
+
+                match read_text(&mut self.reader, buf, &mut self.state.offset) {
+                    ReadTextResult::Markup(buf) => self.read_until_close_impl(buf),
+                    ReadTextResult::Ref(buf) => {
+                        self.state.state = ParseState::InsideRef;
+                        // Return immediately to allow for tail call optimization
+                        return self.read_event_into(buf);
+                    }
+                    ReadTextResult::UpToMarkup(bytes) => {
+                        self.state.state = ParseState::InsideMarkup;
+                        // FIXME: Can produce an empty event if:
+                        // - event contains only spaces
+                        // - trim_text_start = false
+                        // - trim_text_end = true
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    }
+                    ReadTextResult::UpToRef(bytes) => {
+                        self.state.state = ParseState::InsideRef;
+                        // Return Text event with `bytes` content or Eof if bytes is empty
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    }
+                    ReadTextResult::UpToEof(bytes) => {
+                        self.state.state = ParseState::Done;
+                        // Trim bytes from end if required
+                        let event = self.state.emit_text(bytes);
+                        if event.is_empty() {
+                            Ok(Event::Eof)
+                        } else {
+                            Ok(Event::Text(event))
+                        }
+                    }
+                    ReadTextResult::Err(e) => Err(Error::Io(e.into())),
+                }
+            }
+            // Go to InsideText state in next two arms
+            ParseState::InsideMarkup => self.read_until_close_impl(buf),
+            ParseState::InsideEmpty => Ok(Event::End(self.state.close_expanded_empty())),
+            ParseState::Done => Ok(Event::Eof),
+        };
+
+        match event {
+            // #513: In case of ill-formed errors we already consume the wrong data
+            // and change the state. We can continue parsing if we wish
+            Err(Error::IllFormed(_)) => {}
+            Err(_) | Ok(Event::Eof) => self.state.state = ParseState::Done,
+            _ => {}
+        }
+        event
+    }
+
+    /// Private function to read until `>` is found. This function expects that
+    /// it was called just after encounter a `<` symbol.
+    fn read_until_close_impl<'b>(&mut self, buf: &'b mut Vec<u8>) -> Result<Event<'b>> {
+        self.state.state = ParseState::InsideText;
+
+        let start = self.state.offset;
+        match peek_one(&mut self.reader) {
+            // `<!` - comment, CDATA or DOCTYPE declaration
+            Ok(Some(b'!')) => {
+                match read_bang_element(&mut self.reader, buf, &mut self.state.offset) {
+                    Ok((bang_type, bytes)) => self.state.emit_bang(bang_type, bytes),
+                    Err(e) => {
+                        // We want to report error at `<`, but offset was increased,
+                        // so return it back (-1 for `<`)
+                        self.state.last_error_offset = start - 1;
+                        Err(e)
+                    }
+                }
+            }
+            // `</` - closing tag
+            // #776: We parse using ElementParser which allows us to have attributes
+            // in close tags. While such tags are not allowed by the specification,
+            // we anyway allow to parse them because:
+            // - we do not check constraints during parsing. This is performed by the
+            //   optional validate step which user should call manually
+            // - if we just look for `>` we will parse `</tag attr=">" >` as end tag
+            //   `</tag attr=">` and text `" >` which probably no one existing parser
+            //   does. This is malformed XML, however it is tolerated by some parsers
+            //   (e.g. the one used by Adobe Flash) and such documents do exist in the wild.
+            Ok(Some(b'/')) => {
+                consume_one(&mut self.reader, &mut self.state.offset)?;
+
+                match read_element(&mut self.reader, buf, &mut self.state.offset) {
+                    Ok((name_len, bytes)) => self.state.emit_end(name_len, bytes),
+                    Err(e) => {
+                        // We want to report error at `<`, but offset was increased,
+                        // so return it back (-1 for `<`)
+                        self.state.last_error_offset = start - 1;
+                        Err(e)
+                    }
+                }
+            }
+            // `<?` - processing instruction
+            Ok(Some(b'?')) => {
+                match read_with(
+                    &mut self.reader,
+                    PiParser(false),
+                    buf,
+                    &mut self.state.offset,
+                ) {
+                    Ok(bytes) => self.state.emit_question_mark(bytes),
+                    Err(e) => {
+                        // We want to report error at `<`, but offset was increased,
+                        // so return it back (-1 for `<`)
+                        self.state.last_error_offset = start - 1;
+                        Err(e)
+                    }
+                }
+            }
+            // `<...` - opening or self-closed tag
+            Ok(Some(_)) => match read_element(&mut self.reader, buf, &mut self.state.offset) {
+                Ok((name_len, bytes)) => Ok(self.state.emit_start(name_len, bytes)),
+                Err(e) => {
+                    // We want to report error at `<`, but offset was increased,
+                    // so return it back (-1 for `<`)
+                    self.state.last_error_offset = start - 1;
+                    Err(e)
+                }
+            },
+            // `<` - syntax error, tag not closed
+            Ok(None) => {
+                // We want to report error at `<`, but offset was increased,
+                // so return it back (-1 for `<`)
+                self.state.last_error_offset = start - 1;
+                Err(Error::Syntax(SyntaxError::UnclosedTag))
+            }
+            Err(e) => Err(Error::Io(e.into())),
+        }
     }
 
     /// Reads until end element is found using provided buffer as intermediate
@@ -526,10 +710,51 @@ impl<R: BufRead> Reader<R> {
     /// [`expand_empty_elements`]: crate::reader::Config::expand_empty_elements
     /// [`check_end_names`]: crate::reader::Config::check_end_names
     /// [the specification]: https://www.w3.org/TR/xml11/#dt-etag
-    pub fn read_to_end_into(&mut self, end: QName, buf: &mut Vec<u8>) -> Result<Span> {
-        Ok(read_to_end!(self, end, buf, read_event_impl, {
-            buf.clear();
-        }))
+    pub fn read_to_end_into(&mut self, end_name: QName, buf: &mut Vec<u8>) -> Result<Span> {
+        Ok({
+            // Because we take position after the event before the End event,
+            // it is important that this position indicates beginning of the End event.
+            // If between last event and the End event would be only spaces, then we
+            // take position before the spaces, but spaces would be skipped without
+            // generating event if `trim_text_start` is set to `true`. To prevent that
+            // we temporary disable start text trimming.
+            //
+            // We also cannot take position after getting End event, because if
+            // `trim_markup_names_in_closing_tags` is set to `true` (which is the default),
+            // we do not known the real size of the End event that it is occupies in
+            // the source and cannot correct the position after the End event.
+            // So, we in any case should tweak parser configuration.
+            let config = self.config_mut();
+            let trim = config.trim_text_start;
+            config.trim_text_start = false;
+
+            let start = self.buffer_position();
+            let mut depth = 0;
+            loop {
+                buf.clear();
+                let end = self.buffer_position();
+                match self.read_event_into(buf) {
+                    Err(e) => {
+                        self.config_mut().trim_text_start = trim;
+                        return Err(e);
+                    }
+
+                    Ok(Event::Start(e)) if e.name() == end_name => depth += 1,
+                    Ok(Event::End(e)) if e.name() == end_name => {
+                        if depth == 0 {
+                            self.config_mut().trim_text_start = trim;
+                            break start..end;
+                        }
+                        depth -= 1;
+                    }
+                    Ok(Event::Eof) => {
+                        self.config_mut().trim_text_start = trim;
+                        return Err(Error::missed_end(end_name, self.decoder()));
+                    }
+                    _ => (),
+                }
+            }
+        })
     }
 }
 
@@ -544,19 +769,967 @@ impl Reader<BufReader<File>> {
 
 #[cfg(test)]
 mod test {
-    use crate::reader::test::check;
-    use crate::reader::XmlSource;
 
     /// Default buffer constructor just pass the byte array from the test
-    fn identity<T>(input: T) -> T {
-        input
+    // fn identity<T>(input: T) -> T {
+    // input
+    // }
+
+    // check!(
+    // #[test]
+    // read_event_into,
+    // read_until_close_impl,
+    // identity,
+    // &mut Vec::new()
+    // );
+
+    mod read_bang_element {
+        use crate::errors::{Error, SyntaxError};
+        use crate::reader::{BangType, DtdParser};
+        use crate::utils::Bytes;
+
+        /// Checks that reading CDATA content works correctly
+        mod cdata {
+            use crate::reader::buffered_reader::read_bang_element;
+
+            use super::*;
+            use pretty_assertions::assert_eq;
+
+            /// Checks that if input begins like CDATA element, but CDATA start sequence
+            /// is not finished, parsing ends with an error
+            #[test]
+            #[ignore = "start CDATA sequence fully checked outside of `read_bang_element`"]
+            fn not_properly_start() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"![]]>other content".as_ref();
+                //                ^= 1
+
+                match read_bang_element(&mut input, buf, &mut position) {
+                    Err(Error::Syntax(cause)) => assert_eq!(cause, SyntaxError::UnclosedCData),
+                    x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                }
+                assert_eq!(position, 1);
+            }
+
+            /// Checks that if CDATA startup sequence was matched, but an end sequence
+            /// is not found, parsing ends with an error
+            #[test]
+            fn not_closed() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"![CDATA[other content".as_ref();
+                //                ^= 1                 ^= 22
+
+                match read_bang_element(&mut input, buf, &mut position) {
+                    Err(Error::Syntax(cause)) => assert_eq!(cause, SyntaxError::UnclosedCData),
+                    x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                }
+                assert_eq!(position, 22);
+            }
+
+            /// Checks that CDATA element without content inside parsed successfully
+            #[test]
+            fn empty() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"![CDATA[]]>other content".as_ref();
+                //                ^= 1       ^= 12
+
+                let (ty, bytes) = read_bang_element(&mut input, buf, &mut position).unwrap();
+                assert_eq!((ty, Bytes(bytes)), (BangType::CData, Bytes(b"![CDATA[]]")));
+                assert_eq!(position, 12);
+            }
+
+            /// Checks that CDATA element with content parsed successfully.
+            /// Additionally checks that sequences inside CDATA that may look like
+            /// a CDATA end sequence do not interrupt CDATA parsing
+            #[test]
+            fn with_content() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"![CDATA[cdata]] ]>content]]>other content]]>".as_ref();
+                //                ^= 1                        ^= 29
+
+                let (ty, bytes) = read_bang_element(&mut input, buf, &mut position).unwrap();
+                assert_eq!(
+                    (ty, Bytes(bytes)),
+                    (BangType::CData, Bytes(b"![CDATA[cdata]] ]>content]]"))
+                );
+                assert_eq!(position, 29);
+            }
+        }
+
+        /// Checks that reading XML comments works correctly. According to the [specification],
+        /// comment data can contain any sequence except `--`:
+        ///
+        /// ```peg
+        /// comment = '<--' (!'--' char)* '-->';
+        /// char = [#x1-#x2C]
+        ///      / [#x2E-#xD7FF]
+        ///      / [#xE000-#xFFFD]
+        ///      / [#x10000-#x10FFFF]
+        /// ```
+        ///
+        /// The presence of this limitation, however, is simply a poorly designed specification
+        /// (maybe for purpose of building of LL(1) XML parser) and quick-xml does not check for
+        /// presence of these sequences by default. This tests allow such content.
+        ///
+        /// [specification]: https://www.w3.org/TR/xml11/#dt-comment
+        mod comment {
+            use super::*;
+            use crate::reader::buffered_reader::read_bang_element;
+            use pretty_assertions::assert_eq;
+
+            #[test]
+            #[ignore = "start comment sequence fully checked outside of `read_bang_element`"]
+            fn not_properly_start() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"!- -->other content".as_ref();
+                //                ^= 1
+
+                match read_bang_element(&mut input, buf, &mut position) {
+                    Err(Error::Syntax(cause)) => assert_eq!(cause, SyntaxError::UnclosedComment),
+                    x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                }
+                assert_eq!(position, 1);
+            }
+
+            #[test]
+            fn not_properly_end() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"!->other content".as_ref();
+                //                ^= 1            ^= 17
+
+                match read_bang_element(&mut input, buf, &mut position) {
+                    Err(Error::Syntax(cause)) => assert_eq!(cause, SyntaxError::UnclosedComment),
+                    x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                }
+                assert_eq!(position, 17);
+            }
+
+            #[test]
+            fn not_closed1() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"!--other content".as_ref();
+                //                ^= 1            ^= 17
+
+                match read_bang_element(&mut input, buf, &mut position) {
+                    Err(Error::Syntax(cause)) => assert_eq!(cause, SyntaxError::UnclosedComment),
+                    x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                }
+                assert_eq!(position, 17);
+            }
+
+            #[test]
+            fn not_closed2() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"!-->other content".as_ref();
+                //                ^= 1             ^= 18
+
+                match read_bang_element(&mut input, buf, &mut position) {
+                    Err(Error::Syntax(cause)) => assert_eq!(cause, SyntaxError::UnclosedComment),
+                    x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                }
+                assert_eq!(position, 18);
+            }
+
+            #[test]
+            fn not_closed3() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"!--->other content".as_ref();
+                //                ^= 1              ^= 19
+
+                match read_bang_element(&mut input, buf, &mut position) {
+                    Err(Error::Syntax(cause)) => assert_eq!(cause, SyntaxError::UnclosedComment),
+                    x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                }
+                assert_eq!(position, 19);
+            }
+
+            #[test]
+            fn empty() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"!---->other content".as_ref();
+                //                ^= 1  ^= 7
+
+                let (ty, bytes) = read_bang_element(&mut input, buf, &mut position).unwrap();
+                assert_eq!((ty, Bytes(bytes)), (BangType::Comment, Bytes(b"!----")));
+                assert_eq!(position, 7);
+            }
+
+            #[test]
+            fn with_content() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"!--->comment<--->other content".as_ref();
+                //                ^= 1             ^= 18
+
+                let (ty, bytes) = read_bang_element(&mut input, buf, &mut position).unwrap();
+                assert_eq!(
+                    (ty, Bytes(bytes)),
+                    (BangType::Comment, Bytes(b"!--->comment<---"))
+                );
+                assert_eq!(position, 18);
+            }
+        }
+
+        /// Checks that reading DOCTYPE definition works correctly
+        mod doctype {
+            use super::*;
+
+            mod uppercase {
+                use super::*;
+                use crate::reader::buffered_reader::read_bang_element;
+                use pretty_assertions::assert_eq;
+
+                #[test]
+                fn not_properly_start() {
+                    let buf = &mut Vec::new();
+                    let mut position = 1;
+                    let mut input = b"!D other content".as_ref();
+                    //                ^= 1            ^= 17
+
+                    match read_bang_element(&mut input, buf, &mut position) {
+                        Err(Error::Syntax(cause)) => {
+                            assert_eq!(cause, SyntaxError::UnclosedDoctype)
+                        }
+                        x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                    }
+                    assert_eq!(position, 17);
+                }
+
+                #[test]
+                fn without_space() {
+                    let buf = &mut Vec::new();
+                    let mut position = 1;
+                    let mut input = b"!DOCTYPEother content".as_ref();
+                    //                ^= 1                 ^= 22
+
+                    match read_bang_element(&mut input, buf, &mut position) {
+                        Err(Error::Syntax(cause)) => {
+                            assert_eq!(cause, SyntaxError::UnclosedDoctype)
+                        }
+                        x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                    }
+                    assert_eq!(position, 22);
+                }
+
+                #[test]
+                fn empty() {
+                    let buf = &mut Vec::new();
+                    let mut position = 1;
+                    let mut input = b"!DOCTYPE>other content".as_ref();
+                    //                ^= 1     ^= 10
+
+                    let (ty, bytes) = read_bang_element(&mut input, buf, &mut position).unwrap();
+                    assert_eq!(
+                        (ty, Bytes(bytes)),
+                        (BangType::DocType(DtdParser::Finished), Bytes(b"!DOCTYPE"))
+                    );
+                    assert_eq!(position, 10);
+                }
+
+                #[test]
+                fn not_closed() {
+                    let buf = &mut Vec::new();
+                    let mut position = 1;
+                    let mut input = b"!DOCTYPE other content".as_ref();
+                    //                ^= 1                  ^23
+
+                    match read_bang_element(&mut input, buf, &mut position) {
+                        Err(Error::Syntax(cause)) => {
+                            assert_eq!(cause, SyntaxError::UnclosedDoctype)
+                        }
+                        x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                    }
+                    assert_eq!(position, 23);
+                }
+            }
+
+            mod lowercase {
+                use super::*;
+                use crate::reader::buffered_reader::read_bang_element;
+                use pretty_assertions::assert_eq;
+
+                #[test]
+                fn not_properly_start() {
+                    let buf = &mut Vec::new();
+                    let mut position = 1;
+                    let mut input = b"!d other content".as_ref();
+                    //                ^= 1            ^= 17
+
+                    match read_bang_element(&mut input, buf, &mut position) {
+                        Err(Error::Syntax(cause)) => {
+                            assert_eq!(cause, SyntaxError::UnclosedDoctype)
+                        }
+                        x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                    }
+                    assert_eq!(position, 17);
+                }
+
+                #[test]
+                fn without_space() {
+                    let buf = &mut Vec::new();
+                    let mut position = 1;
+                    let mut input = b"!doctypeother content".as_ref();
+                    //                ^= 1                 ^= 22
+
+                    match read_bang_element(&mut input, buf, &mut position) {
+                        Err(Error::Syntax(cause)) => {
+                            assert_eq!(cause, SyntaxError::UnclosedDoctype)
+                        }
+                        x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                    }
+                    assert_eq!(position, 22);
+                }
+
+                #[test]
+                fn empty() {
+                    let buf = &mut Vec::new();
+                    let mut position = 1;
+                    let mut input = b"!doctype>other content".as_ref();
+                    //                ^= 1     ^= 10
+
+                    let (ty, bytes) = read_bang_element(&mut input, buf, &mut position).unwrap();
+                    assert_eq!(
+                        (ty, Bytes(bytes)),
+                        (BangType::DocType(DtdParser::Finished), Bytes(b"!doctype"))
+                    );
+                    assert_eq!(position, 10);
+                }
+
+                #[test]
+                fn not_closed() {
+                    let buf = &mut Vec::new();
+                    let mut position = 1;
+                    let mut input = b"!doctype other content".as_ref();
+                    //                ^= 1                  ^= 23
+
+                    match read_bang_element(&mut input, buf, &mut position) {
+                        Err(Error::Syntax(cause)) => {
+                            assert_eq!(cause, SyntaxError::UnclosedDoctype)
+                        }
+                        x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+                    }
+                    assert_eq!(position, 23);
+                }
+            }
+        }
     }
 
-    check!(
+    mod read_text {
+        use crate::reader::buffered_reader::read_text;
+        use crate::reader::ReadTextResult;
+        use crate::utils::Bytes;
+        use pretty_assertions::assert_eq;
+
         #[test]
-        read_event_impl,
-        read_until_close,
-        identity,
-        &mut Vec::new()
-    );
+        fn empty() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"".as_ref();
+            //                ^= 1
+
+            match read_text(&mut input, buf, &mut position) {
+                ReadTextResult::UpToEof(bytes) => assert_eq!(Bytes(bytes), Bytes(b"")),
+                x => panic!("Expected `UpToEof(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 1);
+        }
+
+        #[test]
+        fn markup() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"<".as_ref();
+            //                 ^= 2
+
+            match read_text(&mut input, buf, &mut position) {
+                ReadTextResult::Markup(b) => assert_eq!(b, &mut Vec::<u8>::new()),
+                x => panic!("Expected `Markup(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 2);
+        }
+
+        #[test]
+        fn ref_() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"&".as_ref();
+            //                ^= 1
+
+            match read_text(&mut input, buf, &mut position) {
+                ReadTextResult::Ref(b) => assert_eq!(b, &mut Vec::<u8>::new()),
+                x => panic!("Expected `Ref(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 1);
+        }
+
+        #[test]
+        fn up_to_markup() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"a<".as_ref();
+            //                1 ^= 3
+
+            match read_text(&mut input, buf, &mut position) {
+                ReadTextResult::UpToMarkup(bytes) => assert_eq!(Bytes(bytes), Bytes(b"a")),
+                x => panic!("Expected `UpToMarkup(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 3);
+        }
+
+        #[test]
+        fn up_to_ref() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"a&".as_ref();
+            //                 ^= 2
+
+            match read_text(&mut input, buf, &mut position) {
+                ReadTextResult::UpToRef(bytes) => assert_eq!(Bytes(bytes), Bytes(b"a")),
+                x => panic!("Expected `UpToRef(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 2);
+        }
+
+        #[test]
+        fn up_to_eof() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"a&".as_ref();
+            //                 ^= 2
+
+            match read_text(&mut input, buf, &mut position) {
+                ReadTextResult::UpToRef(bytes) => assert_eq!(Bytes(bytes), Bytes(b"a")),
+                x => panic!("Expected `UpToRef(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 2);
+        }
+    }
+
+    mod read_ref {
+        use crate::reader::buffered_reader::read_ref;
+        use crate::reader::ReadRefResult;
+        use crate::utils::Bytes;
+        use pretty_assertions::assert_eq;
+
+        // Empty input is not allowed for `read_ref` so not tested.
+        // Borrowed source triggers debug assertion,
+        // buffered do nothing due to implementation details.
+
+        #[test]
+        fn up_to_eof() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"&".as_ref();
+            //                 ^= 2
+
+            match read_ref(&mut input, buf, &mut position) {
+                ReadRefResult::UpToEof(bytes) => assert_eq!(Bytes(bytes), Bytes(b"&")),
+                x => panic!("Expected `UpToEof(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 2);
+        }
+
+        #[test]
+        fn up_to_ref() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"&&".as_ref();
+            //                 ^= 2
+
+            match read_ref(&mut input, buf, &mut position) {
+                ReadRefResult::UpToRef(bytes) => assert_eq!(Bytes(bytes), Bytes(b"&")),
+                x => panic!("Expected `UpToRef(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 2);
+        }
+
+        #[test]
+        fn up_to_markup() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"&<".as_ref();
+            //                  ^= 3
+
+            match read_ref(&mut input, buf, &mut position) {
+                ReadRefResult::UpToMarkup(bytes) => assert_eq!(Bytes(bytes), Bytes(b"&")),
+                x => panic!("Expected `UpToMarkup(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 3);
+        }
+
+        #[test]
+        fn empty_ref() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"&;".as_ref();
+            //                  ^= 3
+
+            match read_ref(&mut input, buf, &mut position) {
+                ReadRefResult::Ref(bytes) => assert_eq!(Bytes(bytes), Bytes(b"&")),
+                x => panic!("Expected `Ref(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 3);
+        }
+
+        #[test]
+        fn normal() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"&lt;".as_ref();
+            //                    ^= 5
+
+            match read_ref(&mut input, buf, &mut position) {
+                ReadRefResult::Ref(bytes) => assert_eq!(Bytes(bytes), Bytes(b"&lt")),
+                x => panic!("Expected `Ref(_)`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 5);
+        }
+    }
+
+    // TODO(flxbe): use new parser here
+    mod read_element {
+        use crate::reader::buffered_reader::read_with;
+        use crate::errors::{Error, SyntaxError};
+        use crate::parser::ElementParser;
+        use crate::utils::Bytes;
+        use pretty_assertions::assert_eq;
+
+        /// Checks that nothing was read from empty buffer
+        #[test]
+        fn empty() {
+            let buf = &mut Vec::new();
+            let mut position = 1;
+            let mut input = b"".as_ref();
+            //                ^= 1
+
+            match read_with(&mut input, ElementParser::default(), buf, &mut position) {
+                Err(Error::Syntax(cause)) => assert_eq!(cause, SyntaxError::UnclosedTag),
+                x => panic!("Expected `Err(Syntax(_))`, but got `{:?}`", x),
+            }
+            assert_eq!(position, 1);
+        }
+
+        mod open {
+            use super::*;
+            use pretty_assertions::assert_eq;
+
+            #[test]
+            fn empty_tag() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b">".as_ref();
+                //                 ^= 2
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b"")
+                );
+                assert_eq!(position, 2);
+            }
+
+            #[test]
+            fn normal() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"tag>".as_ref();
+                //                    ^= 5
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b"tag")
+                );
+                assert_eq!(position, 5);
+            }
+
+            #[test]
+            fn empty_ns_empty_tag() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b":>".as_ref();
+                //                  ^= 3
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b":")
+                );
+                assert_eq!(position, 3);
+            }
+
+            #[test]
+            fn empty_ns() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b":tag>".as_ref();
+                //                     ^= 6
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b":tag")
+                );
+                assert_eq!(position, 6);
+            }
+
+            #[test]
+            fn with_attributes() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = br#"tag  attr-1=">"  attr2  =  '>'  3attr>"#.as_ref();
+                //                                                        ^= 39
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(br#"tag  attr-1=">"  attr2  =  '>'  3attr"#)
+                );
+                assert_eq!(position, 39);
+            }
+        }
+
+        mod self_closed {
+            use super::*;
+            use pretty_assertions::assert_eq;
+
+            #[test]
+            fn empty_tag() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"/>".as_ref();
+                //                  ^= 3
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b"/")
+                );
+                assert_eq!(position, 3);
+            }
+
+            #[test]
+            fn normal() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"tag/>".as_ref();
+                //                     ^= 6
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b"tag/")
+                );
+                assert_eq!(position, 6);
+            }
+
+            #[test]
+            fn empty_ns_empty_tag() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b":/>".as_ref();
+                //                   ^= 4
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b":/")
+                );
+                assert_eq!(position, 4);
+            }
+
+            #[test]
+            fn empty_ns() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b":tag/>".as_ref();
+                //                      ^= 7
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b":tag/")
+                );
+                assert_eq!(position, 7);
+            }
+
+            #[test]
+            fn with_attributes() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = br#"tag  attr-1="/>"  attr2  =  '/>'  3attr/>"#.as_ref();
+                //                                                           ^= 42
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(br#"tag  attr-1="/>"  attr2  =  '/>'  3attr/"#)
+                );
+                assert_eq!(position, 42);
+            }
+        }
+
+        mod close {
+            use super::*;
+            use pretty_assertions::assert_eq;
+
+            #[test]
+            fn empty_tag() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"/ >".as_ref();
+                //                   ^= 4
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b"/ ")
+                );
+                assert_eq!(position, 4);
+            }
+
+            #[test]
+            fn normal() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"/tag>".as_ref();
+                //                     ^= 6
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b"/tag")
+                );
+                assert_eq!(position, 6);
+            }
+
+            #[test]
+            fn empty_ns_empty_tag() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"/:>".as_ref();
+                //                   ^= 4
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b"/:")
+                );
+                assert_eq!(position, 4);
+            }
+
+            #[test]
+            fn empty_ns() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = b"/:tag>".as_ref();
+                //                      ^= 7
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(b"/:tag")
+                );
+                assert_eq!(position, 7);
+            }
+
+            #[test]
+            fn with_attributes() {
+                let buf = &mut Vec::new();
+                let mut position = 1;
+                let mut input = br#"/tag  attr-1=">"  attr2  =  '>'  3attr>"#.as_ref();
+                //                                                         ^= 40
+
+                assert_eq!(
+                    Bytes(
+                        read_with(&mut input, ElementParser::default(), buf, &mut position)
+                            .unwrap()
+                    ),
+                    Bytes(br#"/tag  attr-1=">"  attr2  =  '>'  3attr"#)
+                );
+                assert_eq!(position, 40);
+            }
+        }
+    }
+
+    /// Ensures, that no empty `Text` events are generated
+    mod read_event_into {
+        use crate::events::{
+            BytesCData, BytesDecl, BytesEnd, BytesPI, BytesStart, BytesText, Event,
+        };
+        use crate::reader::Reader;
+        use pretty_assertions::assert_eq;
+        use std::io::{BufReader, Cursor};
+
+        fn create_reader(input: impl AsRef<[u8]>) -> Reader<BufReader<Cursor<Vec<u8>>>> {
+            let vec = Vec::from(input.as_ref());
+            let reader = BufReader::new(std::io::Cursor::new(vec));
+            Reader::from_reader(reader)
+        }
+
+        /// When `encoding` feature is enabled, encoding should be detected
+        /// from BOM (UTF-8) and BOM should be stripped.
+        ///
+        /// When `encoding` feature is disabled, UTF-8 is assumed and BOM
+        /// character should be stripped for consistency
+        #[test]
+        fn bom_from_reader() {
+            let mut reader = create_reader("\u{feff}\u{feff}");
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::Text(BytesText::from_escaped("\u{feff}"))
+            );
+
+            assert_eq!(reader.read_event_into(&mut Vec::new()).unwrap(), Event::Eof);
+        }
+
+        /// When parsing from &str, encoding is fixed (UTF-8), so
+        /// - when `encoding` feature is disabled, the behavior the
+        ///   same as in `bom_from_reader` text
+        /// - when `encoding` feature is enabled, the behavior should
+        ///   stay consistent, so the first BOM character is stripped
+        #[test]
+        fn bom_from_str() {
+            let mut reader = create_reader("\u{feff}\u{feff}");
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::Text(BytesText::from_escaped("\u{feff}"))
+            );
+
+            assert_eq!(reader.read_event_into(&mut Vec::new()).unwrap(), Event::Eof);
+        }
+
+        #[test]
+        fn declaration() {
+            let mut reader = create_reader("<?xml ?>");
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::Decl(BytesDecl::from_start(BytesStart::from_content("xml ", 3)))
+            );
+        }
+
+        #[test]
+        fn doctype() {
+            let mut reader = create_reader("<!DOCTYPE x>");
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::DocType(BytesText::from_escaped("x"))
+            );
+        }
+
+        #[test]
+        fn processing_instruction() {
+            let mut reader = create_reader("<?xml-stylesheet '? >\" ?>");
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::PI(BytesPI::new("xml-stylesheet '? >\" "))
+            );
+        }
+
+        /// Lone closing tags are not allowed, so testing it together with start tag
+        #[test]
+        fn start_and_end() {
+            let mut reader = create_reader("<tag></tag>");
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::Start(BytesStart::new("tag"))
+            );
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::End(BytesEnd::new("tag"))
+            );
+        }
+
+        #[test]
+        fn empty() {
+            let mut reader = create_reader("<tag/>");
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::Empty(BytesStart::new("tag"))
+            );
+        }
+
+        #[test]
+        fn text() {
+            let mut reader = create_reader("text");
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::Text(BytesText::from_escaped("text"))
+            );
+        }
+
+        #[test]
+        fn cdata() {
+            let mut reader = create_reader("<![CDATA[]]>");
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::CData(BytesCData::new(""))
+            );
+        }
+
+        #[test]
+        fn comment() {
+            let mut reader = create_reader("<!---->");
+
+            assert_eq!(
+                reader.read_event_into(&mut Vec::new()).unwrap(),
+                Event::Comment(BytesText::from_escaped(""))
+            );
+        }
+
+        #[test]
+        fn eof() {
+            let mut reader = create_reader("");
+
+            assert_eq!(reader.read_event_into(&mut Vec::new()).unwrap(), Event::Eof);
+        }
+    }
 }

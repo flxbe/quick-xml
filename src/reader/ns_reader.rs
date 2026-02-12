@@ -13,7 +13,7 @@ use std::path::Path;
 use crate::errors::Result;
 use crate::events::Event;
 use crate::name::{LocalName, NamespaceBindingsIter, NamespaceResolver, QName, ResolveResult};
-use crate::reader::{Config, Reader, Span, XmlSource};
+use crate::reader::{Config, Reader, Span};
 
 /// A low level encoding-agnostic XML event reader that performs namespace resolution.
 ///
@@ -145,15 +145,6 @@ impl<R> NsReader<R> {
             ns_resolver: NamespaceResolver::default(),
             pending_pop: false,
         }
-    }
-
-    fn read_event_impl<'i, B>(&mut self, buf: B) -> Result<Event<'i>>
-    where
-        R: XmlSource<'i, B>,
-    {
-        self.pop();
-        let event = self.reader.read_event_impl(buf);
-        self.process_event(event)
     }
 
     pub(super) fn pop(&mut self) {
@@ -435,7 +426,9 @@ impl<R: BufRead> NsReader<R> {
     /// [`read_resolved_event_into()`]: Self::read_resolved_event_into
     #[inline]
     pub fn read_event_into<'b>(&mut self, buf: &'b mut Vec<u8>) -> Result<Event<'b>> {
-        self.read_event_impl(buf)
+        self.pop();
+        let event = self.reader.read_event_into(buf);
+        self.process_event(event)
     }
 
     /// Reads the next event into given buffer and resolves its namespace (if applicable).
@@ -499,7 +492,7 @@ impl<R: BufRead> NsReader<R> {
         &mut self,
         buf: &'b mut Vec<u8>,
     ) -> Result<(ResolveResult<'_>, Event<'b>)> {
-        let event = self.read_event_impl(buf)?;
+        let event = self.read_event_into(buf)?;
         Ok(self.ns_resolver.resolve_event(event))
     }
 
@@ -679,7 +672,9 @@ impl<'i> NsReader<&'i [u8]> {
     /// [`read_resolved_event()`]: Self::read_resolved_event
     #[inline]
     pub fn read_event(&mut self) -> Result<Event<'i>> {
-        self.read_event_impl(())
+        self.pop();
+        let event = self.reader.read_event();
+        self.process_event(event)
     }
 
     /// Reads the next event, borrow its content from the input buffer, and resolves
@@ -743,7 +738,7 @@ impl<'i> NsReader<&'i [u8]> {
     /// [`read_event()`]: Self::read_event
     #[inline]
     pub fn read_resolved_event(&mut self) -> Result<(ResolveResult<'_>, Event<'i>)> {
-        let event = self.read_event_impl(())?;
+        let event = self.read_event()?;
         Ok(self.ns_resolver.resolve_event(event))
     }
 
