@@ -6,14 +6,13 @@ use criterion::{self, criterion_group, criterion_main, Criterion, Throughput};
 use quick_xml::events::Event;
 use quick_xml::reader::NsReader;
 use quick_xml::Result as XmlResult;
-use std::fs;
 use std::hint::black_box;
 
-static BOB_PATH: &str = "./tests/documents/bob.xml";
+static BOB: &str = include_str!("../tests/documents/bob.xml");
 
 // TODO: use fully normalized attribute values
-fn parse_document_from_bytes_with_namespaces(file_path: &str) -> XmlResult<()> {
-    let mut r = NsReader::from_file(file_path)?;
+fn parse_document_from_bytes_with_namespaces(input: &str) -> XmlResult<()> {
+    let mut r = NsReader::from_str(input);
     let mut buf = Vec::new();
     loop {
         match black_box(r.read_resolved_event_into(&mut buf)?) {
@@ -44,10 +43,9 @@ fn parse_document_from_bytes_with_namespaces(file_path: &str) -> XmlResult<()> {
 pub fn bench_decode_and_parse_document_with_namespaces(c: &mut Criterion) {
     let mut group = c.benchmark_group("parse_bob_from_file");
 
-    let metadata = fs::metadata(BOB_PATH).unwrap();
-    group.throughput(Throughput::Bytes(metadata.len()));
+    group.throughput(Throughput::Bytes(BOB.len() as u64));
 
-    group.bench_with_input("BOB", BOB_PATH, |b, input| {
+    group.bench_with_input("BOB", BOB, |b, input| {
         b.iter(|| parse_document_from_bytes_with_namespaces(input))
     });
 
