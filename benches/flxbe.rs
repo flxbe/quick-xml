@@ -11,8 +11,9 @@ static BOB: &str = include_str!("../tests/documents/bob.xml");
 
 fn parse_from_reader(input: &str) -> XmlResult<()> {
     let mut r = Reader::from_str(input);
+    let mut buf = Vec::new();
     loop {
-        match black_box(r.read_event()?) {
+        match black_box(r.read_event_into(&mut buf)?) {
             Event::Start(e) | Event::Empty(e) => {
                 black_box(e.local_name());
                 for attr in e.attributes() {
@@ -35,9 +36,8 @@ fn parse_from_reader(input: &str) -> XmlResult<()> {
 
 fn parse_from_slice(input: &str) -> XmlResult<()> {
     let mut r = Reader::from_str(input);
-    let mut buf = Vec::new();
     loop {
-        match black_box(r.read_event_into(&mut buf)?) {
+        match black_box(r.read_event()?) {
             Event::Start(e) | Event::Empty(e) => {
                 black_box(e.local_name());
                 for attr in e.attributes() {
