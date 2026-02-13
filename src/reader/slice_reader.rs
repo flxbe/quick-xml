@@ -96,88 +96,8 @@ impl<'a> Reader<&'a [u8]> {
                 // Return directly to enable tail call optimization.
                 return self.read_event();
             }
-            ParseState::InsideRef => {
-                let decoder = self.decoder();
-
-                // Go to InsideText
-                let start = self.state.offset;
-                match self.read_ref_event() {
-                    // Emit reference, go to InsideText state
-                    ReadRefResult::Ref(bytes) => {
-                        self.state.state = ParseState::InsideText;
-                        // +1 to skip start `&`
-                        Ok(Event::GeneralRef(BytesRef::wrap(&bytes[1..], decoder)))
-                    }
-                    // Go to Done state
-                    ReadRefResult::UpToEof(bytes) if self.state.config.allow_dangling_amp => {
-                        self.state.state = ParseState::Done;
-                        Ok(Event::Text(self.state.emit_text(bytes)))
-                    }
-                    ReadRefResult::UpToEof(_) => {
-                        self.state.state = ParseState::Done;
-                        self.state.last_error_offset = start;
-                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
-                    }
-                    // Do not change state, stay in InsideRef
-                    ReadRefResult::UpToRef(bytes) if self.state.config.allow_dangling_amp => {
-                        Ok(Event::Text(self.state.emit_text(bytes)))
-                    }
-                    ReadRefResult::UpToRef(_) => {
-                        self.state.last_error_offset = start;
-                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
-                    }
-                    // Go to InsideMarkup state
-                    ReadRefResult::UpToMarkup(bytes) if self.state.config.allow_dangling_amp => {
-                        self.state.state = ParseState::InsideMarkup;
-                        Ok(Event::Text(self.state.emit_text(bytes)))
-                    }
-                    ReadRefResult::UpToMarkup(_) => {
-                        self.state.state = ParseState::InsideMarkup;
-                        self.state.last_error_offset = start;
-                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
-                    }
-                    ReadRefResult::Err(e) => Err(Error::Io(e.into())),
-                }
-            }
-            ParseState::InsideText => {
-                // Go to InsideMarkup or Done state
-                if self.state.config.trim_text_start {
-                    skip_whitespace(&mut self.reader, &mut self.state.offset)?;
-                }
-
-                match self.read_text_event() {
-                    ReadTextResult::Markup(_) => self.read_until_close(),
-                    ReadTextResult::Ref(_) => {
-                        self.state.state = ParseState::InsideRef;
-                        // Return immediately to allow for tail call optimization
-                        return self.read_event();
-                    }
-                    ReadTextResult::UpToMarkup(bytes) => {
-                        self.state.state = ParseState::InsideMarkup;
-                        // FIXME: Can produce an empty event if:
-                        // - event contains only spaces
-                        // - trim_text_start = false
-                        // - trim_text_end = true
-                        Ok(Event::Text(self.state.emit_text(bytes)))
-                    }
-                    ReadTextResult::UpToRef(bytes) => {
-                        self.state.state = ParseState::InsideRef;
-                        // Return Text event with `bytes` content or Eof if bytes is empty
-                        Ok(Event::Text(self.state.emit_text(bytes)))
-                    }
-                    ReadTextResult::UpToEof(bytes) => {
-                        self.state.state = ParseState::Done;
-                        // Trim bytes from end if required
-                        let event = self.state.emit_text(bytes);
-                        if event.is_empty() {
-                            Ok(Event::Eof)
-                        } else {
-                            Ok(Event::Text(event))
-                        }
-                    }
-                    ReadTextResult::Err(e) => Err(Error::Io(e.into())),
-                }
-            }
+            ParseState::InsideRef => self.read_ref_event(),
+            ParseState::InsideText => self.read_text_event(),
             // Go to InsideText state in next two arms
             ParseState::InsideMarkup => self.read_until_close(),
             ParseState::InsideEmpty => Ok(Event::End(self.state.close_expanded_empty())),
@@ -489,40 +409,65 @@ impl<'a> Reader<&'a [u8]> {
     }
 
     #[inline]
-    fn read_text_event(&mut self) -> ReadTextResult<'a, ()> {
+    fn read_text_event(&mut self) -> Result<Event<'a>> {
+        // Go to InsideMarkup or Done state
+        if self.state.config.trim_text_start {
+            skip_whitespace(&mut self.reader, &mut self.state.offset)?;
+        }
+
         // Search for start of markup or an entity or character reference
         match memchr::memchr2(b'<', b'&', self.reader) {
             Some(0) if self.reader[0] == b'<' => {
                 self.reader = &self.reader[1..];
                 self.state.offset += 1;
-                ReadTextResult::Markup(())
+
+                self.read_until_close()
             }
             // Do not consume `&` because it may be lone and we would be need to
             // return it as part of Text event
-            Some(0) => ReadTextResult::Ref(()),
+            Some(0) => self.read_ref_event(),
             Some(i) if self.reader[i] == b'<' => {
                 let bytes = &self.reader[..i];
                 self.reader = &self.reader[i + 1..];
                 self.state.offset += i as u64 + 1;
-                ReadTextResult::UpToMarkup(bytes)
+
+                self.state.state = ParseState::InsideMarkup;
+                // FIXME: Can produce an empty event if:
+                // - event contains only spaces
+                // - trim_text_start = false
+                // - trim_text_end = true
+                Ok(Event::Text(self.state.emit_text(bytes)))
             }
             Some(i) => {
                 let (bytes, rest) = self.reader.split_at(i);
                 self.reader = rest;
                 self.state.offset += i as u64;
-                ReadTextResult::UpToRef(bytes)
+
+                self.state.state = ParseState::InsideRef;
+                // Return Text event with `bytes` content or Eof if bytes is empty
+                Ok(Event::Text(self.state.emit_text(bytes)))
             }
             None => {
                 let bytes = &self.reader[..];
                 self.reader = &[];
                 self.state.offset += bytes.len() as u64;
-                ReadTextResult::UpToEof(bytes)
+
+                self.state.state = ParseState::Done;
+                // Trim bytes from end if required
+                let event = self.state.emit_text(bytes);
+                if event.is_empty() {
+                    Ok(Event::Eof)
+                } else {
+                    Ok(Event::Text(event))
+                }
             }
         }
     }
 
     #[inline]
-    fn read_ref_event(&mut self) -> ReadRefResult<'a> {
+    fn read_ref_event(&mut self) -> Result<Event<'a>> {
+        let start = self.state.offset;
+
         debug_assert_eq!(
             self.reader.first(),
             Some(&b'&'),
@@ -537,7 +482,15 @@ impl<'a> Reader<&'a [u8]> {
                 self.reader = rest;
                 self.state.offset += i as u64 + 1;
 
-                ReadRefResult::UpToRef(bytes)
+                self.state.state = ParseState::InsideRef;
+
+                // ReadRefResult::UpToRef(bytes)
+                if self.state.config.allow_dangling_amp {
+                    Ok(Event::Text(self.state.emit_text(bytes)))
+                } else {
+                    self.state.last_error_offset = start;
+                    Err(Error::IllFormed(IllFormedError::UnclosedReference))
+                }
             }
             Some(i) => {
                 let end = i + 1;
@@ -548,9 +501,23 @@ impl<'a> Reader<&'a [u8]> {
                 self.state.offset += end as u64 + 1;
 
                 if is_end {
-                    ReadRefResult::Ref(bytes)
+                    // ReadRefResult::Ref(bytes)
+                    self.state.state = ParseState::InsideText;
+                    // +1 to skip start `&`
+                    Ok(Event::GeneralRef(BytesRef::wrap(
+                        &bytes[1..],
+                        self.decoder(),
+                    )))
                 } else {
-                    ReadRefResult::UpToMarkup(bytes)
+                    // ReadRefResult::UpToMarkup(bytes)
+                    if self.state.config.allow_dangling_amp {
+                        self.state.state = ParseState::InsideMarkup;
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    } else {
+                        self.state.state = ParseState::InsideMarkup;
+                        self.state.last_error_offset = start;
+                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
+                    }
                 }
             }
             None => {
@@ -558,7 +525,15 @@ impl<'a> Reader<&'a [u8]> {
                 self.reader = &[];
                 self.state.offset += bytes.len() as u64;
 
-                ReadRefResult::UpToEof(bytes)
+                // ReadRefResult::UpToEof(bytes)
+                if self.state.config.allow_dangling_amp {
+                    self.state.state = ParseState::Done;
+                    Ok(Event::Text(self.state.emit_text(bytes)))
+                } else {
+                    self.state.state = ParseState::Done;
+                    self.state.last_error_offset = start;
+                    Err(Error::IllFormed(IllFormedError::UnclosedReference))
+                }
             }
         }
     }
