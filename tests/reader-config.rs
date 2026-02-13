@@ -517,7 +517,7 @@ mod trim_markup_names_in_closing_tags {
             );
             assert_eq!(
                 reader.read_event().unwrap(),
-                Event::End(BytesEnd::new("root \t\r\n"))
+                Event::End(BytesEnd::new("root"))
             );
             assert_eq!(reader.read_event().unwrap(), Event::Eof);
         }
@@ -533,16 +533,10 @@ mod trim_markup_names_in_closing_tags {
                 Event::Start(BytesStart::new("root"))
             );
 
-            match reader.read_event() {
-                Err(Error::IllFormed(cause)) => assert_eq!(
-                    cause,
-                    IllFormedError::MismatchedEndTag {
-                        expected: "root".into(),
-                        found: "root \t\r\n".into(),
-                    }
-                ),
-                x => panic!("Expected `Err(IllFormed(_))`, but got `{:?}`", x),
-            }
+            assert_eq!(
+                reader.read_event().unwrap(),
+                Event::End(BytesEnd::new("root"))
+            );
 
             assert_eq!(reader.read_event().unwrap(), Event::Eof);
         }

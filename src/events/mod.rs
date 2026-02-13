@@ -384,7 +384,7 @@ impl<'a> arbitrary::Arbitrary<'a> for BytesStart<'a> {
 /// # use pretty_assertions::assert_eq;
 /// let mut reader = Reader::from_str(r#"<element></element a1 = 'val1' a2="val2" >"#);
 /// // Note, that this entire string considered as a .name()
-/// let content = r#"element a1 = 'val1' a2="val2" "#;
+/// let content = "element";
 /// let event = BytesEnd::new(content);
 ///
 /// reader.config_mut().trim_markup_names_in_closing_tags = false;

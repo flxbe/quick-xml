@@ -488,6 +488,9 @@ impl<R: BufRead> Reader<R> {
             //   does. This is malformed XML, however it is tolerated by some parsers
             //   (e.g. the one used by Adobe Flash) and such documents do exist in the wild.
             Ok(Some(b'/')) => {
+                self.reader.consume(1);
+                self.state.offset += 1;
+
                 match read_with(
                     &mut self.reader,
                     ElementParser::Outside,
