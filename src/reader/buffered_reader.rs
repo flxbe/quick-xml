@@ -10,7 +10,7 @@ use crate::events::{BytesRef, Event};
 use crate::name::QName;
 use crate::parser::fast_element::FastElementParser;
 use crate::parser::{Parser, PiParser};
-use crate::reader::{BangType, ParseState, ReadRefResult, ReadTextResult, Reader, Span};
+use crate::reader::{BangType, ParseState, Reader, Span};
 use crate::utils::is_whitespace;
 
 #[cfg(not(feature = "encoding"))]
@@ -53,36 +53,10 @@ fn detect_encoding<R: BufRead>(r: &mut R) -> io::Result<Option<&'static encoding
 
 #[inline]
 fn read_text<'b, R: BufRead>(reader: &mut Reader<R>, buf: &'b mut Vec<u8>) -> Result<Event<'b>> {
-    // ReadTextResult::Markup(buf) => self.read_until_close_impl(buf),
-    // ReadTextResult::Ref(buf) => {
-    //     self.state.state = ParseState::InsideRef;
-    //     // Return immediately to allow for tail call optimization
-    //     return self.read_event_into(buf);
-    // }
-    // ReadTextResult::UpToMarkup(bytes) => {
-    //     self.state.state = ParseState::InsideMarkup;
-    //     // FIXME: Can produce an empty event if:
-    //     // - event contains only spaces
-    //     // - trim_text_start = false
-    //     // - trim_text_end = true
-    //     Ok(Event::Text(self.state.emit_text(bytes)))
-    // }
-    // ReadTextResult::UpToRef(bytes) => {
-    //     self.state.state = ParseState::InsideRef;
-    //     // Return Text event with `bytes` content or Eof if bytes is empty
-    //     Ok(Event::Text(self.state.emit_text(bytes)))
-    // }
-    // ReadTextResult::UpToEof(bytes) => {
-    //     self.state.state = ParseState::Done;
-    //     // Trim bytes from end if required
-    //     let event = self.state.emit_text(bytes);
-    //     if event.is_empty() {
-    //         Ok(Event::Eof)
-    //     } else {
-    //         Ok(Event::Text(event))
-    //     }
-    // }
-    // ReadTextResult::Err(e) => Err(Error::Io(e.into())),
+    // Go to InsideMarkup or Done state
+    if reader.state.config.trim_text_start {
+        skip_whitespace(&mut reader.reader, &mut reader.state.offset)?;
+    }
 
     let mut read = 0;
     let start = buf.len();
@@ -99,7 +73,6 @@ fn read_text<'b, R: BufRead>(reader: &mut Reader<R>, buf: &'b mut Vec<u8>) -> Re
                 } else {
                     return Ok(Event::Text(event));
                 }
-                //ReadTextResult::UpToEof(&buf[start..])
             }
             Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -123,8 +96,7 @@ fn read_text<'b, R: BufRead>(reader: &mut Reader<R>, buf: &'b mut Vec<u8>) -> Re
             // Do not consume `&` because it may be lone and we would be need to
             // return it as part of Text event
             Some(0) if read == 0 => {
-                reader.state.state = ParseState::InsideRef;
-                return reader.read_event_into(buf);
+                return read_ref(reader, buf);
             }
             Some(i) if available[i] == b'<' => {
                 buf.extend_from_slice(&available[..i]);
@@ -167,21 +139,29 @@ fn read_text<'b, R: BufRead>(reader: &mut Reader<R>, buf: &'b mut Vec<u8>) -> Re
 }
 
 #[inline]
-fn read_ref<'b, R: BufRead>(
-    r: &mut R,
-    buf: &'b mut Vec<u8>,
-    position: &mut u64,
-) -> ReadRefResult<'b> {
+fn read_ref<'b, R: BufRead>(reader: &mut Reader<R>, buf: &'b mut Vec<u8>) -> Result<Event<'b>> {
+    let start_offset = reader.state.offset;
+
     let mut read = 0;
     let start = buf.len();
     loop {
-        let available = match r.fill_buf() {
-            Ok(n) if n.is_empty() => break,
+        let available = match reader.reader.fill_buf() {
+            Ok(n) if n.is_empty() => {
+                reader.state.state = ParseState::Done;
+                reader.state.offset += read;
+
+                if reader.state.config.allow_dangling_amp {
+                    return Ok(Event::Text(reader.state.emit_text(&buf[start..])));
+                } else {
+                    reader.state.last_error_offset = start_offset;
+                    return Err(Error::IllFormed(IllFormedError::UnclosedReference));
+                }
+            }
             Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                *position += read;
-                return ReadRefResult::Err(e);
+                reader.state.offset += read;
+                return Err(Error::Io(e.into()));
             }
         };
         // `read_ref` called when the first character is `&`, so we
@@ -196,7 +176,7 @@ fn read_ref<'b, R: BufRead>(
             // If that ampersand is lone, then it will be part of text
             // and we should keep it
             buf.push(b'&');
-            r.consume(1);
+            reader.reader.consume(1);
             read += 1;
             continue;
         }
@@ -207,12 +187,18 @@ fn read_ref<'b, R: BufRead>(
             Some(i) if available[i] == b'&' => {
                 buf.extend_from_slice(&available[..i]);
 
-                r.consume(i);
+                reader.reader.consume(i);
                 read += i as u64;
 
-                *position += read;
+                reader.state.offset += read;
 
-                return ReadRefResult::UpToRef(&buf[start..]);
+                // return ReadRefResult::UpToRef(&buf[start..]);
+                if reader.state.config.allow_dangling_amp {
+                    return Ok(Event::Text(reader.state.emit_text(&buf[start..])));
+                } else {
+                    reader.state.last_error_offset = start_offset;
+                    return Err(Error::IllFormed(IllFormedError::UnclosedReference));
+                }
             }
             Some(i) => {
                 let is_end = available[i] == b';';
@@ -220,29 +206,41 @@ fn read_ref<'b, R: BufRead>(
 
                 // +1 -- skip the end `;` or `<`
                 let used = i + 1;
-                r.consume(used);
+                reader.reader.consume(used);
                 read += used as u64;
 
-                *position += read;
+                reader.state.offset += read;
 
-                return if is_end {
-                    ReadRefResult::Ref(&buf[start..])
+                let bytes = &buf[start..];
+                if is_end {
+                    // ReadRefResult::Ref(&buf[start..])
+                    reader.state.state = ParseState::InsideText;
+                    // +1 to skip start `&`
+                    return Ok(Event::GeneralRef(BytesRef::wrap(
+                        &bytes[1..],
+                        reader.decoder(),
+                    )));
                 } else {
-                    ReadRefResult::UpToMarkup(&buf[start..])
+                    // ReadRefResult::UpToMarkup(&buf[start..])
+                    if reader.state.config.allow_dangling_amp {
+                        reader.state.state = ParseState::InsideMarkup;
+                        return Ok(Event::Text(reader.state.emit_text(bytes)));
+                    } else {
+                        reader.state.state = ParseState::InsideMarkup;
+                        reader.state.last_error_offset = start_offset;
+                        return Err(Error::IllFormed(IllFormedError::UnclosedReference));
+                    }
                 };
             }
             None => {
                 buf.extend_from_slice(available);
 
                 let used = available.len();
-                r.consume(used);
+                reader.reader.consume(used);
                 read += used as u64;
             }
         }
     }
-
-    *position += read;
-    ReadRefResult::UpToEof(&buf[start..])
 }
 
 #[inline]
@@ -413,13 +411,6 @@ fn peek_one<R: BufRead>(r: &mut R) -> io::Result<Option<u8>> {
     }
 }
 
-#[inline]
-fn consume_one<R: BufRead>(r: &mut R, position: &mut u64) -> io::Result<()> {
-    r.consume(1);
-    *position += 1;
-    Ok(())
-}
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// This is an implementation for reading from a [`BufRead`] as underlying byte stream.
@@ -493,58 +484,8 @@ impl<R: BufRead> Reader<R> {
                 // Return directly to enable tail call optimization.
                 return self.read_event_into(buf);
             }
-            ParseState::InsideRef => {
-                // Go to InsideText
-                let start = self.state.offset;
-                match read_ref(&mut self.reader, buf, &mut self.state.offset) {
-                    // Emit reference, go to InsideText state
-                    ReadRefResult::Ref(bytes) => {
-                        self.state.state = ParseState::InsideText;
-                        // +1 to skip start `&`
-                        Ok(Event::GeneralRef(BytesRef::wrap(
-                            &bytes[1..],
-                            self.decoder(),
-                        )))
-                    }
-                    // Go to Done state
-                    ReadRefResult::UpToEof(bytes) if self.state.config.allow_dangling_amp => {
-                        self.state.state = ParseState::Done;
-                        Ok(Event::Text(self.state.emit_text(bytes)))
-                    }
-                    ReadRefResult::UpToEof(_) => {
-                        self.state.state = ParseState::Done;
-                        self.state.last_error_offset = start;
-                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
-                    }
-                    // Do not change state, stay in InsideRef
-                    ReadRefResult::UpToRef(bytes) if self.state.config.allow_dangling_amp => {
-                        Ok(Event::Text(self.state.emit_text(bytes)))
-                    }
-                    ReadRefResult::UpToRef(_) => {
-                        self.state.last_error_offset = start;
-                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
-                    }
-                    // Go to InsideMarkup state
-                    ReadRefResult::UpToMarkup(bytes) if self.state.config.allow_dangling_amp => {
-                        self.state.state = ParseState::InsideMarkup;
-                        Ok(Event::Text(self.state.emit_text(bytes)))
-                    }
-                    ReadRefResult::UpToMarkup(_) => {
-                        self.state.state = ParseState::InsideMarkup;
-                        self.state.last_error_offset = start;
-                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
-                    }
-                    ReadRefResult::Err(e) => Err(Error::Io(e.into())),
-                }
-            }
-            ParseState::InsideText => {
-                // Go to InsideMarkup or Done state
-                if self.state.config.trim_text_start {
-                    skip_whitespace(&mut self.reader, &mut self.state.offset)?;
-                }
-
-                return read_text(self, buf);
-            }
+            ParseState::InsideRef => return read_ref(self, buf),
+            ParseState::InsideText => return read_text(self, buf),
             // Go to InsideText state in next two arms
             ParseState::InsideMarkup => self.read_until_close_impl(buf),
             ParseState::InsideEmpty => Ok(Event::End(self.state.close_expanded_empty())),
@@ -591,7 +532,8 @@ impl<R: BufRead> Reader<R> {
             //   does. This is malformed XML, however it is tolerated by some parsers
             //   (e.g. the one used by Adobe Flash) and such documents do exist in the wild.
             Ok(Some(b'/')) => {
-                consume_one(&mut self.reader, &mut self.state.offset)?;
+                self.reader.consume(1);
+                self.state.offset += 1;
 
                 match read_element(&mut self.reader, buf, &mut self.state.offset) {
                     Ok((name_len, bytes)) => self.state.emit_end(name_len, bytes),
