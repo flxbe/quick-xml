@@ -52,21 +52,61 @@ fn detect_encoding<R: BufRead>(r: &mut R) -> io::Result<Option<&'static encoding
 }
 
 #[inline]
-fn read_text<'b, R: BufRead>(
-    r: &mut R,
-    buf: &'b mut Vec<u8>,
-    position: &mut u64,
-) -> ReadTextResult<'b, &'b mut Vec<u8>> {
+fn read_text<'b, R: BufRead>(reader: &mut Reader<R>, buf: &'b mut Vec<u8>) -> Result<Event<'b>> {
+    // ReadTextResult::Markup(buf) => self.read_until_close_impl(buf),
+    // ReadTextResult::Ref(buf) => {
+    //     self.state.state = ParseState::InsideRef;
+    //     // Return immediately to allow for tail call optimization
+    //     return self.read_event_into(buf);
+    // }
+    // ReadTextResult::UpToMarkup(bytes) => {
+    //     self.state.state = ParseState::InsideMarkup;
+    //     // FIXME: Can produce an empty event if:
+    //     // - event contains only spaces
+    //     // - trim_text_start = false
+    //     // - trim_text_end = true
+    //     Ok(Event::Text(self.state.emit_text(bytes)))
+    // }
+    // ReadTextResult::UpToRef(bytes) => {
+    //     self.state.state = ParseState::InsideRef;
+    //     // Return Text event with `bytes` content or Eof if bytes is empty
+    //     Ok(Event::Text(self.state.emit_text(bytes)))
+    // }
+    // ReadTextResult::UpToEof(bytes) => {
+    //     self.state.state = ParseState::Done;
+    //     // Trim bytes from end if required
+    //     let event = self.state.emit_text(bytes);
+    //     if event.is_empty() {
+    //         Ok(Event::Eof)
+    //     } else {
+    //         Ok(Event::Text(event))
+    //     }
+    // }
+    // ReadTextResult::Err(e) => Err(Error::Io(e.into())),
+
     let mut read = 0;
     let start = buf.len();
     loop {
-        let available = match r.fill_buf() {
-            Ok(n) if n.is_empty() => break,
+        let available = match reader.reader.fill_buf() {
+            Ok(n) if n.is_empty() => {
+                reader.state.offset += read;
+                reader.state.state = ParseState::Done;
+
+                // Trim bytes from end if required
+                let event = reader.state.emit_text(&buf[start..]);
+                if event.is_empty() {
+                    return Ok(Event::Eof);
+                } else {
+                    return Ok(Event::Text(event));
+                }
+                //ReadTextResult::UpToEof(&buf[start..])
+            }
             Ok(n) => n,
             Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                *position += read;
-                return ReadTextResult::Err(e);
+                reader.state.offset += read;
+                reader.state.state = ParseState::Done;
+                return Err(Error::Io(e.into()));
             }
         };
 
@@ -75,45 +115,55 @@ fn read_text<'b, R: BufRead>(
             // Special handling is needed only on the first iteration.
             // On next iterations we already read something and should emit Text event
             Some(0) if read == 0 && available[0] == b'<' => {
-                r.consume(1);
-                *position += 1;
-                return ReadTextResult::Markup(buf);
+                reader.reader.consume(1);
+                reader.state.offset += 1;
+
+                return reader.read_until_close_impl(buf);
             }
             // Do not consume `&` because it may be lone and we would be need to
             // return it as part of Text event
-            Some(0) if read == 0 => return ReadTextResult::Ref(buf),
+            Some(0) if read == 0 => {
+                reader.state.state = ParseState::InsideRef;
+                return reader.read_event_into(buf);
+            }
             Some(i) if available[i] == b'<' => {
                 buf.extend_from_slice(&available[..i]);
 
                 // +1 to skip `<`
                 let used = i + 1;
-                r.consume(used);
+                reader.reader.consume(used);
                 read += used as u64;
 
-                *position += read;
-                return ReadTextResult::UpToMarkup(&buf[start..]);
+                reader.state.offset += read;
+
+                reader.state.state = ParseState::InsideMarkup;
+                // FIXME: Can produce an empty event if:
+                // - event contains only spaces
+                // - trim_text_start = false
+                // - trim_text_end = true
+                return Ok(Event::Text(reader.state.emit_text(&buf[start..])));
             }
             Some(i) => {
                 buf.extend_from_slice(&available[..i]);
 
-                r.consume(i);
+                reader.reader.consume(i);
                 read += i as u64;
 
-                *position += read;
-                return ReadTextResult::UpToRef(&buf[start..]);
+                reader.state.offset += read;
+
+                reader.state.state = ParseState::InsideRef;
+                // Return Text event with `bytes` content or Eof if bytes is empty
+                return Ok(Event::Text(reader.state.emit_text(&buf[start..])));
             }
             None => {
                 buf.extend_from_slice(available);
 
                 let used = available.len();
-                r.consume(used);
+                reader.reader.consume(used);
                 read += used as u64;
             }
         }
     }
-
-    *position += read;
-    ReadTextResult::UpToEof(&buf[start..])
 }
 
 #[inline]
@@ -493,38 +543,7 @@ impl<R: BufRead> Reader<R> {
                     skip_whitespace(&mut self.reader, &mut self.state.offset)?;
                 }
 
-                match read_text(&mut self.reader, buf, &mut self.state.offset) {
-                    ReadTextResult::Markup(buf) => self.read_until_close_impl(buf),
-                    ReadTextResult::Ref(buf) => {
-                        self.state.state = ParseState::InsideRef;
-                        // Return immediately to allow for tail call optimization
-                        return self.read_event_into(buf);
-                    }
-                    ReadTextResult::UpToMarkup(bytes) => {
-                        self.state.state = ParseState::InsideMarkup;
-                        // FIXME: Can produce an empty event if:
-                        // - event contains only spaces
-                        // - trim_text_start = false
-                        // - trim_text_end = true
-                        Ok(Event::Text(self.state.emit_text(bytes)))
-                    }
-                    ReadTextResult::UpToRef(bytes) => {
-                        self.state.state = ParseState::InsideRef;
-                        // Return Text event with `bytes` content or Eof if bytes is empty
-                        Ok(Event::Text(self.state.emit_text(bytes)))
-                    }
-                    ReadTextResult::UpToEof(bytes) => {
-                        self.state.state = ParseState::Done;
-                        // Trim bytes from end if required
-                        let event = self.state.emit_text(bytes);
-                        if event.is_empty() {
-                            Ok(Event::Eof)
-                        } else {
-                            Ok(Event::Text(event))
-                        }
-                    }
-                    ReadTextResult::Err(e) => Err(Error::Io(e.into())),
-                }
+                return read_text(self, buf);
             }
             // Go to InsideText state in next two arms
             ParseState::InsideMarkup => self.read_until_close_impl(buf),
