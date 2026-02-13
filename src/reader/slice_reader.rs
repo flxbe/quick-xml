@@ -11,11 +11,11 @@ use crate::reader::EncodingRef;
 #[cfg(feature = "encoding")]
 use encoding_rs::{Encoding, UTF_8};
 
-use crate::errors::{Error, Result};
-use crate::events::Event;
+use crate::errors::{Error, IllFormedError, Result, SyntaxError};
+use crate::events::{BytesRef, Event};
 use crate::name::QName;
-use crate::parser::Parser;
-use crate::reader::{BangType, ReadRefResult, ReadTextResult, Reader, Span, XmlSource};
+use crate::parser::{Parser, PiParser};
+use crate::reader::{BangType, ParseState, ReadRefResult, ReadTextResult, Reader, Span};
 use crate::utils::is_whitespace;
 
 /// This is an implementation for reading from a `&[u8]` as underlying byte stream.
@@ -73,7 +73,216 @@ impl<'a> Reader<&'a [u8]> {
     /// ```
     #[inline]
     pub fn read_event(&mut self) -> Result<Event<'a>> {
-        self.read_event_impl(())
+        let event = match self.state.state {
+            ParseState::Init => {
+                // Go to InsideText state
+                // If encoding set explicitly, we not need to detect it. For example,
+                // explicit UTF-8 set automatically if Reader was created using `from_str`.
+                // But we still need to remove BOM for consistency with no encoding
+                // feature enabled path
+                #[cfg(feature = "encoding")]
+                if let Some(encoding) = reader.detect_encoding()? {
+                    if self.state.encoding.can_be_refined() {
+                        self.state.encoding = crate::reader::EncodingRef::BomDetected(encoding);
+                    }
+                }
+
+                // Removes UTF-8 BOM if it is present
+                #[cfg(not(feature = "encoding"))]
+                let _ = remove_utf8_bom(&mut self.reader)?;
+
+                self.state.state = ParseState::InsideText;
+
+                // Return directly to enable tail call optimization.
+                return self.read_event();
+            }
+            ParseState::InsideRef => {
+                let decoder = self.decoder();
+
+                // Go to InsideText
+                let start = self.state.offset;
+                match self.read_ref_event() {
+                    // Emit reference, go to InsideText state
+                    ReadRefResult::Ref(bytes) => {
+                        self.state.state = ParseState::InsideText;
+                        // +1 to skip start `&`
+                        Ok(Event::GeneralRef(BytesRef::wrap(&bytes[1..], decoder)))
+                    }
+                    // Go to Done state
+                    ReadRefResult::UpToEof(bytes) if self.state.config.allow_dangling_amp => {
+                        self.state.state = ParseState::Done;
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    }
+                    ReadRefResult::UpToEof(_) => {
+                        self.state.state = ParseState::Done;
+                        self.state.last_error_offset = start;
+                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
+                    }
+                    // Do not change state, stay in InsideRef
+                    ReadRefResult::UpToRef(bytes) if self.state.config.allow_dangling_amp => {
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    }
+                    ReadRefResult::UpToRef(_) => {
+                        self.state.last_error_offset = start;
+                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
+                    }
+                    // Go to InsideMarkup state
+                    ReadRefResult::UpToMarkup(bytes) if self.state.config.allow_dangling_amp => {
+                        self.state.state = ParseState::InsideMarkup;
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    }
+                    ReadRefResult::UpToMarkup(_) => {
+                        self.state.state = ParseState::InsideMarkup;
+                        self.state.last_error_offset = start;
+                        Err(Error::IllFormed(IllFormedError::UnclosedReference))
+                    }
+                    ReadRefResult::Err(e) => Err(Error::Io(e.into())),
+                }
+            }
+            ParseState::InsideText => {
+                // Go to InsideMarkup or Done state
+                if self.state.config.trim_text_start {
+                    skip_whitespace(&mut self.reader, &mut self.state.offset)?;
+                }
+
+                match self.read_text_event() {
+                    ReadTextResult::Markup(_) => self.read_until_close(),
+                    ReadTextResult::Ref(_) => {
+                        self.state.state = ParseState::InsideRef;
+                        // Return immediately to allow for tail call optimization
+                        return self.read_event();
+                    }
+                    ReadTextResult::UpToMarkup(bytes) => {
+                        self.state.state = ParseState::InsideMarkup;
+                        // FIXME: Can produce an empty event if:
+                        // - event contains only spaces
+                        // - trim_text_start = false
+                        // - trim_text_end = true
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    }
+                    ReadTextResult::UpToRef(bytes) => {
+                        self.state.state = ParseState::InsideRef;
+                        // Return Text event with `bytes` content or Eof if bytes is empty
+                        Ok(Event::Text(self.state.emit_text(bytes)))
+                    }
+                    ReadTextResult::UpToEof(bytes) => {
+                        self.state.state = ParseState::Done;
+                        // Trim bytes from end if required
+                        let event = self.state.emit_text(bytes);
+                        if event.is_empty() {
+                            Ok(Event::Eof)
+                        } else {
+                            Ok(Event::Text(event))
+                        }
+                    }
+                    ReadTextResult::Err(e) => Err(Error::Io(e.into())),
+                }
+            }
+            // Go to InsideText state in next two arms
+            ParseState::InsideMarkup => self.read_until_close(),
+            ParseState::InsideEmpty => Ok(Event::End(self.state.close_expanded_empty())),
+            ParseState::Done => Ok(Event::Eof),
+        };
+
+        match event {
+            // #513: In case of ill-formed errors we already consume the wrong data
+            // and change the state. We can continue parsing if we wish
+            Err(Error::IllFormed(_)) => {}
+            Err(_) | Ok(Event::Eof) => self.state.state = ParseState::Done,
+            _ => {}
+        }
+        event
+    }
+
+    /// Read bytes up to the `>` and skip it. This method is expected to be called
+    /// after seeing the `<` symbol and skipping it. Inspects the next (current)
+    /// symbol and returns an appropriate [`Event`]:
+    ///
+    /// |Symbol |Event
+    /// |-------|-------------------------------------
+    /// |`!`    |[`Comment`], [`CData`] or [`DocType`]
+    /// |`/`    |[`End`]
+    /// |`?`    |[`PI`]
+    /// |_other_|[`Start`] or [`Empty`]
+    ///
+    /// Moves parser to the `InsideText` state.
+    ///
+    /// [`Comment`]: Event::Comment
+    /// [`CData`]: Event::CData
+    /// [`DocType`]: Event::DocType
+    /// [`End`]: Event::End
+    /// [`PI`]: Event::PI
+    /// [`Start`]: Event::Start
+    /// [`Empty`]: Event::Empty
+    fn read_until_close(&mut self) -> Result<Event<'a>> {
+        self.state.state = ParseState::InsideText;
+
+        let start = self.state.offset;
+        match peek_one(&mut self.reader) {
+            // `<!` - comment, CDATA or DOCTYPE declaration
+            Ok(Some(b'!')) => match self.read_bang_element() {
+                Ok((bang_type, bytes)) => self.state.emit_bang(bang_type, bytes),
+                Err(e) => {
+                    // We want to report error at `<`, but offset was increased,
+                    // so return it back (-1 for `<`)
+                    self.state.last_error_offset = start - 1;
+                    Err(e)
+                }
+            },
+            // `</` - closing tag
+            // #776: We parse using ElementParser which allows us to have attributes
+            // in close tags. While such tags are not allowed by the specification,
+            // we anyway allow to parse them because:
+            // - we do not check constraints during parsing. This is performed by the
+            //   optional validate step which user should call manually
+            // - if we just look for `>` we will parse `</tag attr=">" >` as end tag
+            //   `</tag attr=">` and text `" >` which probably no one existing parser
+            //   does. This is malformed XML, however it is tolerated by some parsers
+            //   (e.g. the one used by Adobe Flash) and such documents do exist in the wild.
+            Ok(Some(b'/')) => {
+                consume_one(&mut self.reader, &mut self.state.offset)?;
+
+                match self.read_element() {
+                    Ok((name_len, bytes)) => self.state.emit_end(name_len, bytes),
+                    Err(e) => {
+                        // We want to report error at `<`, but offset was increased,
+                        // so return it back (-1 for `<`)
+                        self.state.last_error_offset = start - 1;
+                        Err(e)
+                    }
+                }
+            }
+            // `<?` - processing instruction
+            Ok(Some(b'?')) => {
+                match self.read_with(PiParser(false)) {
+                    Ok(bytes) => self.state.emit_question_mark(bytes),
+                    Err(e) => {
+                        // We want to report error at `<`, but offset was increased,
+                        // so return it back (-1 for `<`)
+                        self.state.last_error_offset = start - 1;
+                        Err(e)
+                    }
+                }
+            }
+            // `<...` - opening or self-closed tag
+            Ok(Some(_)) => match self.read_element() {
+                Ok((name_len, bytes)) => Ok(self.state.emit_start(name_len, bytes)),
+                Err(e) => {
+                    // We want to report error at `<`, but offset was increased,
+                    // so return it back (-1 for `<`)
+                    self.state.last_error_offset = start - 1;
+                    Err(e)
+                }
+            },
+            // `<` - syntax error, tag not closed
+            Ok(None) => {
+                // We want to report error at `<`, but offset was increased,
+                // so return it back (-1 for `<`)
+                self.state.last_error_offset = start - 1;
+                Err(Error::Syntax(SyntaxError::UnclosedTag))
+            }
+            Err(e) => Err(Error::Io(e.into())),
+        }
     }
 
     /// Reads until end element is found. This function is supposed to be called
@@ -156,8 +365,50 @@ impl<'a> Reader<&'a [u8]> {
     /// [`expand_empty_elements`]: crate::reader::Config::expand_empty_elements
     /// [`check_end_names`]: crate::reader::Config::check_end_names
     /// [the specification]: https://www.w3.org/TR/xml11/#dt-etag
-    pub fn read_to_end(&mut self, end: QName) -> Result<Span> {
-        Ok(read_to_end!(self, end, (), read_event_impl, {}))
+    pub fn read_to_end(&mut self, end_name: QName) -> Result<Span> {
+        Ok({
+            // Because we take position after the event before the End event,
+            // it is important that this position indicates beginning of the End event.
+            // If between last event and the End event would be only spaces, then we
+            // take position before the spaces, but spaces would be skipped without
+            // generating event if `trim_text_start` is set to `true`. To prevent that
+            // we temporary disable start text trimming.
+            //
+            // We also cannot take position after getting End event, because if
+            // `trim_markup_names_in_closing_tags` is set to `true` (which is the default),
+            // we do not known the real size of the End event that it is occupies in
+            // the source and cannot correct the position after the End event.
+            // So, we in any case should tweak parser configuration.
+            let config = self.config_mut();
+            let trim = config.trim_text_start;
+            config.trim_text_start = false;
+
+            let start = self.buffer_position();
+            let mut depth = 0;
+            loop {
+                let end = self.buffer_position();
+                match self.read_event() {
+                    Err(e) => {
+                        self.config_mut().trim_text_start = trim;
+                        return Err(e);
+                    }
+
+                    Ok(Event::Start(e)) if e.name() == end_name => depth += 1,
+                    Ok(Event::End(e)) if e.name() == end_name => {
+                        if depth == 0 {
+                            self.config_mut().trim_text_start = trim;
+                            break start..end;
+                        }
+                        depth -= 1;
+                    }
+                    Ok(Event::Eof) => {
+                        self.config_mut().trim_text_start = trim;
+                        return Err(Error::missed_end(end_name, self.decoder()));
+                    }
+                    _ => (),
+                }
+            }
+        })
     }
 
     /// Reads content between start and end tags, including any markup. This
@@ -236,90 +487,65 @@ impl<'a> Reader<&'a [u8]> {
         // was created from offsets from a single &[u8] slice
         Ok(self.decoder().decode(&buffer[0..len as usize])?)
     }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-/// Implementation of `XmlSource` for `&[u8]` reader using a `Self` as buffer
-/// that will be borrowed by events. This implementation provides a zero-copy deserialization
-impl<'a> XmlSource<'a, ()> for &'a [u8] {
-    #[cfg(not(feature = "encoding"))]
-    #[inline]
-    fn remove_utf8_bom(&mut self) -> io::Result<()> {
-        if self.starts_with(crate::encoding::UTF8_BOM) {
-            *self = &self[crate::encoding::UTF8_BOM.len()..];
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "encoding")]
-    #[inline]
-    fn detect_encoding(&mut self) -> io::Result<Option<&'static Encoding>> {
-        if let Some((enc, bom_len)) = crate::encoding::detect_encoding(self) {
-            *self = &self[bom_len..];
-            return Ok(Some(enc));
-        }
-        Ok(None)
-    }
 
     #[inline]
-    fn read_text(&mut self, _buf: (), position: &mut u64) -> ReadTextResult<'a, ()> {
+    fn read_text_event(&mut self) -> ReadTextResult<'a, ()> {
         // Search for start of markup or an entity or character reference
-        match memchr::memchr2(b'<', b'&', self) {
-            Some(0) if self[0] == b'<' => {
-                *self = &self[1..];
-                *position += 1;
+        match memchr::memchr2(b'<', b'&', self.reader) {
+            Some(0) if self.reader[0] == b'<' => {
+                self.reader = &self.reader[1..];
+                self.state.offset += 1;
                 ReadTextResult::Markup(())
             }
             // Do not consume `&` because it may be lone and we would be need to
             // return it as part of Text event
             Some(0) => ReadTextResult::Ref(()),
-            Some(i) if self[i] == b'<' => {
-                let bytes = &self[..i];
-                *self = &self[i + 1..];
-                *position += i as u64 + 1;
+            Some(i) if self.reader[i] == b'<' => {
+                let bytes = &self.reader[..i];
+                self.reader = &self.reader[i + 1..];
+                self.state.offset += i as u64 + 1;
                 ReadTextResult::UpToMarkup(bytes)
             }
             Some(i) => {
-                let (bytes, rest) = self.split_at(i);
-                *self = rest;
-                *position += i as u64;
+                let (bytes, rest) = self.reader.split_at(i);
+                self.reader = rest;
+                self.state.offset += i as u64;
                 ReadTextResult::UpToRef(bytes)
             }
             None => {
-                let bytes = &self[..];
-                *self = &[];
-                *position += bytes.len() as u64;
+                let bytes = &self.reader[..];
+                self.reader = &[];
+                self.state.offset += bytes.len() as u64;
                 ReadTextResult::UpToEof(bytes)
             }
         }
     }
 
     #[inline]
-    fn read_ref(&mut self, _buf: (), position: &mut u64) -> ReadRefResult<'a> {
+    fn read_ref_event(&mut self) -> ReadRefResult<'a> {
         debug_assert_eq!(
-            self.first(),
+            self.reader.first(),
             Some(&b'&'),
             "`read_ref` must be called at `&`"
         );
         // Search for the end of reference or a start of another reference or a markup
-        match memchr::memchr3(b';', b'&', b'<', &self[1..]) {
+        match memchr::memchr3(b';', b'&', b'<', &self.reader[1..]) {
             // Do not consume `&` because it may be lone and we would be need to
             // return it as part of Text event
-            Some(i) if self[i + 1] == b'&' => {
-                let (bytes, rest) = self.split_at(i + 1);
-                *self = rest;
-                *position += i as u64 + 1;
+            Some(i) if self.reader[i + 1] == b'&' => {
+                let (bytes, rest) = self.reader.split_at(i + 1);
+                self.reader = rest;
+                self.state.offset += i as u64 + 1;
 
                 ReadRefResult::UpToRef(bytes)
             }
             Some(i) => {
                 let end = i + 1;
-                let is_end = self[end] == b';';
-                let bytes = &self[..end];
+                let is_end = self.reader[end] == b';';
+                let bytes = &self.reader[..end];
                 // +1 -- skip the end `;` or `<`
-                *self = &self[end + 1..];
-                *position += end as u64 + 1;
+                self.reader = &self.reader[end + 1..];
+                self.state.offset += end as u64 + 1;
 
                 if is_end {
                     ReadRefResult::Ref(bytes)
@@ -328,9 +554,9 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
                 }
             }
             None => {
-                let bytes = &self[..];
-                *self = &[];
-                *position += bytes.len() as u64;
+                let bytes = &self.reader[..];
+                self.reader = &[];
+                self.state.offset += bytes.len() as u64;
 
                 ReadRefResult::UpToEof(bytes)
             }
@@ -338,95 +564,97 @@ impl<'a> XmlSource<'a, ()> for &'a [u8] {
     }
 
     #[inline]
-    fn read_element(&mut self, _buf: (), position: &mut u64) -> Result<(usize, &'a [u8])> {
-        let mut parser = FastElementParser::default();
-
-        if let Some((name_len, consumed)) = parser.feed(self) {
-            // +1 for `>` which we do not include
-            *position += consumed as u64 + 1;
-            let bytes = &self[..consumed];
-            *self = &self[consumed + 1..];
-            return Ok((name_len, bytes));
-        }
-
-        *position += self.len() as u64;
-        Err(Error::Syntax(parser.eof_error(self)))
-    }
-
-    #[inline]
-    fn read_with<P>(&mut self, mut parser: P, _buf: (), position: &mut u64) -> Result<&'a [u8]>
+    fn read_with<P>(&mut self, mut parser: P) -> Result<&'a [u8]>
     where
         P: Parser,
     {
-        if let Some(i) = parser.feed(self) {
+        if let Some(i) = parser.feed(self.reader) {
             // +1 for `>` which we do not include
-            *position += i as u64 + 1;
-            let bytes = &self[..i];
-            *self = &self[i + 1..];
+            self.state.offset += i as u64 + 1;
+            let bytes = &self.reader[..i];
+            self.reader = &self.reader[i + 1..];
             return Ok(bytes);
         }
 
-        *position += self.len() as u64;
-        Err(Error::Syntax(parser.eof_error(self)))
+        self.state.offset += self.reader.len() as u64;
+        Err(Error::Syntax(parser.eof_error(self.reader)))
     }
 
     #[inline]
-    fn read_bang_element(&mut self, _buf: (), position: &mut u64) -> Result<(BangType, &'a [u8])> {
+    fn read_bang_element(&mut self) -> Result<(BangType, &'a [u8])> {
         // Peeked one bang ('!') before being called, so it's guaranteed to
         // start with it.
-        debug_assert_eq!(self[0], b'!');
+        debug_assert_eq!(self.reader[0], b'!');
 
-        let mut bang_type = BangType::new(self[1..].first().copied())?;
+        let mut bang_type = BangType::new(self.reader[1..].first().copied())?;
 
-        if let Some((bytes, i)) = bang_type.parse(&[], self) {
-            *position += i as u64;
-            *self = &self[i..];
+        if let Some((bytes, i)) = bang_type.parse(&[], self.reader) {
+            self.state.offset += i as u64;
+            self.reader = &self.reader[i..];
             return Ok((bang_type, bytes));
         }
 
-        *position += self.len() as u64;
+        self.state.offset += self.reader.len() as u64;
         Err(bang_type.to_err().into())
     }
 
     #[inline]
-    fn skip_whitespace(&mut self, position: &mut u64) -> io::Result<()> {
-        let whitespaces = self
-            .iter()
-            .position(|b| !is_whitespace(*b))
-            .unwrap_or(self.len());
-        *position += whitespaces as u64;
-        *self = &self[whitespaces..];
-        Ok(())
-    }
+    fn read_element(&mut self) -> Result<(usize, &'a [u8])> {
+        let mut parser = FastElementParser::default();
 
-    #[inline]
-    fn peek_one(&mut self) -> io::Result<Option<u8>> {
-        Ok(self.first().copied())
-    }
+        if let Some((name_len, consumed)) = parser.feed(self.reader) {
+            // +1 for `>` which we do not include
+            self.state.offset += consumed as u64 + 1;
+            let bytes = &self.reader[..consumed];
+            self.reader = &self.reader[consumed + 1..];
+            return Ok((name_len, bytes));
+        }
 
-    #[inline]
-    fn consume_one(&mut self, position: &mut u64) -> io::Result<()> {
-        *self = &self[1..];
-        *position += 1;
-        Ok(())
+        self.state.offset += self.reader.len() as u64;
+        Err(Error::Syntax(parser.eof_error(self.reader)))
     }
 }
 
-#[cfg(test)]
-mod test {
-    use crate::reader::test::check;
-    use crate::reader::XmlSource;
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// Default buffer constructor just pass the byte array from the test
-    fn identity<T>(input: T) -> T {
-        input
+#[cfg(not(feature = "encoding"))]
+#[inline]
+fn remove_utf8_bom(source: &mut &[u8]) -> io::Result<()> {
+    if source.starts_with(crate::encoding::UTF8_BOM) {
+        *source = &source[crate::encoding::UTF8_BOM.len()..];
     }
+    Ok(())
+}
 
-    check!(
-        #[test]
-        read_event_impl,
-        read_until_close,
-        identity,
-        ()
-    );
+#[cfg(feature = "encoding")]
+#[inline]
+fn detect_encoding(source: &mut &[u8]) -> io::Result<Option<&'static Encoding>> {
+    if let Some((enc, bom_len)) = crate::encoding::detect_encoding(source) {
+        *source = &source[bom_len..];
+        return Ok(Some(enc));
+    }
+    Ok(None)
+}
+
+#[inline]
+fn skip_whitespace(source: &mut &[u8], position: &mut u64) -> io::Result<()> {
+    let whitespaces = source
+        .iter()
+        .position(|b| !is_whitespace(*b))
+        .unwrap_or(source.len());
+    *position += whitespaces as u64;
+    *source = &source[whitespaces..];
+    Ok(())
+}
+
+#[inline]
+fn peek_one(source: &mut &[u8]) -> io::Result<Option<u8>> {
+    Ok(source.first().copied())
+}
+
+#[inline]
+fn consume_one(source: &mut &[u8], position: &mut u64) -> io::Result<()> {
+    *source = &source[1..];
+    *position += 1;
+    Ok(())
 }
