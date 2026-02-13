@@ -29,7 +29,6 @@ fn parse_from_reader(input: &str) -> XmlResult<()> {
             Event::Eof => break,
             _ => (),
         }
-        // buf.clear();
     }
     Ok(())
 }
@@ -55,7 +54,6 @@ fn parse_from_slice(input: &str) -> XmlResult<()> {
             Event::Eof => break,
             _ => (),
         }
-        // buf.clear();
     }
     Ok(())
 }
