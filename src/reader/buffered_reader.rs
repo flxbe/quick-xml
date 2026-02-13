@@ -436,7 +436,7 @@ impl<R: BufRead> Reader<R> {
 
                 // Removes UTF-8 BOM if it is present
                 #[cfg(not(feature = "encoding"))]
-                remove_utf8_bom(&mut self.reader);
+                let _ = remove_utf8_bom(&mut self.reader)?;
 
                 self.state.state = ParseState::InsideText;
 
@@ -1298,9 +1298,9 @@ mod test {
 
     // TODO(flxbe): use new parser here
     mod read_element {
-        use crate::reader::buffered_reader::read_with;
         use crate::errors::{Error, SyntaxError};
         use crate::parser::ElementParser;
+        use crate::reader::buffered_reader::read_with;
         use crate::utils::Bytes;
         use pretty_assertions::assert_eq;
 
