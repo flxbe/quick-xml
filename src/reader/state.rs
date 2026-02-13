@@ -174,14 +174,27 @@ impl ReaderState {
     /// Wraps content of `buf` into the [`Event::End`] event. Does the check that
     /// end name matches the last opened start name if `self.config.check_end_names` is set.
     ///
-    /// `buf` contains data between `</` and `>`, for example `tag   \n`.
-    pub fn emit_end<'b>(&mut self, name_len: usize, buf: &'b [u8]) -> Result<Event<'b>> {
-        // TODO(flxbe): Just pass the name instead of the buf and the name_len.
-        debug_assert!(
-            name_len <= buf.len(),
-            "The length of the name must not be longer than the total content of the tag."
+    /// `buf` contains data between `<` and `>`, for example `/tag`.
+    pub fn emit_end<'b>(&mut self, buf: &'b [u8]) -> Result<Event<'b>> {
+        debug_assert_eq!(
+            buf.first(),
+            Some(&b'/'),
+            "closing tag should start from '/'"
         );
-        let name = &buf[..name_len];
+
+        // Strip the `/` character. `content` contains data between `</` and `>`
+        let content = &buf[1..];
+        // XML standard permits whitespaces after the markup name in closing tags.
+        // Let's strip them from the buffer before comparing tag names.
+        let name = if self.config.trim_markup_names_in_closing_tags {
+            if let Some(pos_end_name) = content.iter().rposition(|&b| !is_whitespace(b)) {
+                &content[..pos_end_name + 1]
+            } else {
+                content
+            }
+        } else {
+            content
+        };
 
         let decoder = self.decoder();
 
@@ -196,8 +209,8 @@ impl ReaderState {
                         self.opened_buffer.truncate(start);
 
                         // Report error at start of the end tag at `<` character
-                        // -3 for `</` and `>`
-                        self.last_error_offset = self.offset - buf.len() as u64 - 3;
+                        // -2 for `<` and `>`
+                        self.last_error_offset = self.offset - buf.len() as u64 - 2;
                         return Err(Error::IllFormed(IllFormedError::MismatchedEndTag {
                             expected,
                             found: decoder.decode(name).unwrap_or_default().into_owned(),
@@ -210,8 +223,8 @@ impl ReaderState {
             None => {
                 if !self.config.allow_unmatched_ends {
                     // Report error at start of the end tag at `<` character
-                    // -3 for `</` and `>`
-                    self.last_error_offset = self.offset - buf.len() as u64 - 3;
+                    // -2 for `<` and `>`
+                    self.last_error_offset = self.offset - buf.len() as u64 - 2;
                     return Err(Error::IllFormed(IllFormedError::UnmatchedEndTag(
                         decoder.decode(name).unwrap_or_default().into_owned(),
                     )));
@@ -270,10 +283,10 @@ impl ReaderState {
     ///
     /// # Parameters
     /// - `content`: Content of a tag between `<` and `>`
-    pub fn emit_start<'b>(&mut self, name_len: usize, content: &'b [u8]) -> Event<'b> {
+    pub fn emit_start<'b>(&mut self, content: &'b [u8]) -> Event<'b> {
         if let Some(content) = content.strip_suffix(b"/") {
             // This is self-closed tag `<something/>`
-            let event = BytesStart::wrap(content, name_len, self.decoder());
+            let event = BytesStart::wrap(content, name_len(content), self.decoder());
 
             if self.config.expand_empty_elements {
                 self.state = ParseState::InsideEmpty;
@@ -284,7 +297,7 @@ impl ReaderState {
                 Event::Empty(event)
             }
         } else {
-            let event = BytesStart::wrap(content, name_len, self.decoder());
+            let event = BytesStart::wrap(content, name_len(content), self.decoder());
 
             // #514: Always store names event when .check_end_names == false,
             // because checks can be temporary disabled and when they would be
