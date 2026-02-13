@@ -484,7 +484,7 @@ fn issue776() {
     );
     assert_eq!(
         reader.read_event().unwrap(),
-        Event::End(BytesEnd::new("tag/"))
+        Event::End(BytesEnd::new("tag"))
     );
 
     assert_eq!(
@@ -493,7 +493,7 @@ fn issue776() {
     );
     assert_eq!(
         reader.read_event().unwrap(),
-        Event::End(BytesEnd::new("tag attr=\">\""))
+        Event::End(BytesEnd::new("tag"))
     );
 }
 

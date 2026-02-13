@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::io;
 
+use crate::parser::fast_element::FastElementParser;
 #[cfg(feature = "encoding")]
 use crate::reader::EncodingRef;
 #[cfg(feature = "encoding")]
@@ -13,7 +14,7 @@ use encoding_rs::{Encoding, UTF_8};
 use crate::errors::{Error, IllFormedError, Result, SyntaxError};
 use crate::events::{BytesRef, Event};
 use crate::name::QName;
-use crate::parser::{ElementParser, Parser, PiParser};
+use crate::parser::{Parser, PiParser};
 use crate::reader::{BangType, ParseState, ReadRefResult, ReadTextResult, Reader, Span};
 use crate::utils::is_whitespace;
 
@@ -239,8 +240,10 @@ impl<'a> Reader<&'a [u8]> {
             //   does. This is malformed XML, however it is tolerated by some parsers
             //   (e.g. the one used by Adobe Flash) and such documents do exist in the wild.
             Ok(Some(b'/')) => {
-                match self.read_with(ElementParser::Outside) {
-                    Ok(bytes) => self.state.emit_end(bytes),
+                consume_one(&mut self.reader, &mut self.state.offset)?;
+
+                match self.read_element() {
+                    Ok((name_len, bytes)) => self.state.emit_end(name_len, bytes),
                     Err(e) => {
                         // We want to report error at `<`, but offset was increased,
                         // so return it back (-1 for `<`)
@@ -262,8 +265,8 @@ impl<'a> Reader<&'a [u8]> {
                 }
             }
             // `<...` - opening or self-closed tag
-            Ok(Some(_)) => match self.read_with(ElementParser::Outside) {
-                Ok(bytes) => Ok(self.state.emit_start(bytes)),
+            Ok(Some(_)) => match self.read_element() {
+                Ok((name_len, bytes)) => Ok(self.state.emit_start(name_len, bytes)),
                 Err(e) => {
                     // We want to report error at `<`, but offset was increased,
                     // so return it back (-1 for `<`)
@@ -593,6 +596,22 @@ impl<'a> Reader<&'a [u8]> {
 
         self.state.offset += self.reader.len() as u64;
         Err(bang_type.to_err().into())
+    }
+
+    #[inline]
+    fn read_element(&mut self) -> Result<(usize, &'a [u8])> {
+        let mut parser = FastElementParser::default();
+
+        if let Some((name_len, consumed)) = parser.feed(self.reader) {
+            // +1 for `>` which we do not include
+            self.state.offset += consumed as u64 + 1;
+            let bytes = &self.reader[..consumed];
+            self.reader = &self.reader[consumed + 1..];
+            return Ok((name_len, bytes));
+        }
+
+        self.state.offset += self.reader.len() as u64;
+        Err(Error::Syntax(parser.eof_error(self.reader)))
     }
 }
 

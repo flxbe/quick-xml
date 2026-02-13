@@ -8,7 +8,8 @@ use std::path::Path;
 use crate::errors::{Error, IllFormedError, Result, SyntaxError};
 use crate::events::{BytesRef, Event};
 use crate::name::QName;
-use crate::parser::{ElementParser, Parser, PiParser};
+use crate::parser::fast_element::FastElementParser;
+use crate::parser::{Parser, PiParser};
 use crate::reader::{BangType, ParseState, Reader, Span};
 use crate::utils::is_whitespace;
 
@@ -240,6 +241,49 @@ fn read_ref<'b, R: BufRead>(reader: &mut Reader<R>, buf: &'b mut Vec<u8>) -> Res
             }
         }
     }
+}
+
+#[inline]
+fn read_element<'b, R: BufRead>(
+    r: &mut R,
+    buf: &'b mut Vec<u8>,
+    position: &mut u64,
+) -> Result<(usize, &'b [u8])> {
+    let mut parser = FastElementParser::default();
+    let mut read = 0;
+    let start = buf.len();
+    loop {
+        let available = match r.fill_buf() {
+            Ok(n) if n.is_empty() => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                *position += read;
+                return Err(Error::Io(e.into()));
+            }
+        };
+
+        if let Some((name_len, consumed)) = parser.feed(available) {
+            buf.extend_from_slice(&available[..consumed]);
+
+            // +1 for `>` which we do not include
+            r.consume(consumed + 1);
+            read += consumed as u64 + 1;
+
+            *position += read;
+            return Ok((name_len, &buf[start..]));
+        }
+
+        // The `>` symbol not yet found, continue reading
+        buf.extend_from_slice(available);
+
+        let used = available.len();
+        r.consume(used);
+        read += used as u64;
+    }
+
+    *position += read;
+    Err(Error::Syntax(parser.eof_error(&buf[start..])))
 }
 
 #[inline]
@@ -491,13 +535,8 @@ impl<R: BufRead> Reader<R> {
                 self.reader.consume(1);
                 self.state.offset += 1;
 
-                match read_with(
-                    &mut self.reader,
-                    ElementParser::Outside,
-                    buf,
-                    &mut self.state.offset,
-                ) {
-                    Ok(bytes) => self.state.emit_end(bytes),
+                match read_element(&mut self.reader, buf, &mut self.state.offset) {
+                    Ok((name_len, bytes)) => self.state.emit_end(name_len, bytes),
                     Err(e) => {
                         // We want to report error at `<`, but offset was increased,
                         // so return it back (-1 for `<`)
@@ -524,22 +563,15 @@ impl<R: BufRead> Reader<R> {
                 }
             }
             // `<...` - opening or self-closed tag
-            Ok(Some(_)) => {
-                match read_with(
-                    &mut self.reader,
-                    ElementParser::Outside,
-                    buf,
-                    &mut self.state.offset,
-                ) {
-                    Ok(bytes) => Ok(self.state.emit_start(bytes)),
-                    Err(e) => {
-                        // We want to report error at `<`, but offset was increased,
-                        // so return it back (-1 for `<`)
-                        self.state.last_error_offset = start - 1;
-                        Err(e)
-                    }
+            Ok(Some(_)) => match read_element(&mut self.reader, buf, &mut self.state.offset) {
+                Ok((name_len, bytes)) => Ok(self.state.emit_start(name_len, bytes)),
+                Err(e) => {
+                    // We want to report error at `<`, but offset was increased,
+                    // so return it back (-1 for `<`)
+                    self.state.last_error_offset = start - 1;
+                    Err(e)
                 }
-            }
+            },
             // `<` - syntax error, tag not closed
             Ok(None) => {
                 // We want to report error at `<`, but offset was increased,
