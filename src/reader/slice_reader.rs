@@ -15,7 +15,7 @@ use crate::errors::{Error, IllFormedError, Result, SyntaxError};
 use crate::events::{BytesRef, Event};
 use crate::name::QName;
 use crate::parser::{Parser, PiParser};
-use crate::reader::{BangType, ParseState, ReadRefResult, ReadTextResult, Reader, Span};
+use crate::reader::{BangType, ParseState, Reader, Span};
 use crate::utils::is_whitespace;
 
 /// This is an implementation for reading from a `&[u8]` as underlying byte stream.

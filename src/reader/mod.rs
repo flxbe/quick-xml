@@ -692,50 +692,6 @@ impl<R> Reader<R> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Result of an attempt to read XML textual data from the source.
-#[derive(Debug)]
-enum ReadTextResult<'r, B> {
-    /// Start of markup (`<` character) was found in the first byte. `<` was consumed.
-    /// Contains buffer that should be returned back to the next iteration cycle
-    /// to satisfy borrow checker requirements.
-    Markup(B),
-    /// Start of reference (`&` character) was found in the first byte.
-    /// `&` was not consumed.
-    /// Contains buffer that should be returned back to the next iteration cycle
-    /// to satisfy borrow checker requirements.
-    Ref(B),
-    /// Contains text block up to start of markup (`<` character). `<` was consumed.
-    UpToMarkup(&'r [u8]),
-    /// Contains text block up to start of reference (`&` character).
-    /// `&` was not consumed.
-    UpToRef(&'r [u8]),
-    /// Contains text block up to EOF, neither start of markup (`<` character)
-    /// or start of reference (`&` character) was found.
-    UpToEof(&'r [u8]),
-    /// IO error occurred.
-    Err(io::Error),
-}
-
-/// Result of an attempt to read general reference from the reader.
-#[derive(Debug)]
-enum ReadRefResult<'r> {
-    /// Contains text block up to end of reference (`;` character).
-    /// Result includes start `&`, but not end `;`.
-    Ref(&'r [u8]),
-    /// Contains text block up to EOF. Neither end of reference (`;`), start of
-    /// another reference (`&`) or start of markup (`<`) characters was found.
-    /// Result includes start `&`.
-    UpToEof(&'r [u8]),
-    /// Contains text block up to next possible reference (`&` character).
-    /// Result includes start `&`.
-    UpToRef(&'r [u8]),
-    /// Contains text block up to start of markup (`<` character).
-    /// Result includes start `&`.
-    UpToMarkup(&'r [u8]),
-    /// IO error occurred.
-    Err(io::Error),
-}
-
 /// Possible elements started with `<!`
 #[derive(Debug, PartialEq)]
 enum BangType {
