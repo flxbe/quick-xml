@@ -176,7 +176,6 @@ impl ReaderState {
     ///
     /// `buf` contains data between `</` and `>`, for example `tag   \n`.
     pub fn emit_end<'b>(&mut self, name_len: usize, buf: &'b [u8]) -> Result<Event<'b>> {
-        // TODO(flxbe): Just pass the name instead of the buf and the name_len.
         debug_assert!(
             name_len <= buf.len(),
             "The length of the name must not be longer than the total content of the tag."
