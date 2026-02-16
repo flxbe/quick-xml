@@ -3,7 +3,6 @@
 //! intermediate buffer as the byte slice itself can be used to borrow from.
 
 use std::borrow::Cow;
-use std::io;
 
 use crate::parser::fast_element::FastElementParser;
 #[cfg(feature = "encoding")]
@@ -89,7 +88,7 @@ impl<'a> Reader<&'a [u8]> {
 
                 // Removes UTF-8 BOM if it is present
                 #[cfg(not(feature = "encoding"))]
-                let _ = remove_utf8_bom(&mut self.reader)?;
+                remove_utf8_bom(&mut self.reader);
 
                 self.state.state = ParseState::InsideText;
 
@@ -140,7 +139,7 @@ impl<'a> Reader<&'a [u8]> {
         let start = self.state.offset;
         match peek_one(&mut self.reader) {
             // `<!` - comment, CDATA or DOCTYPE declaration
-            Ok(Some(b'!')) => match self.read_bang_element() {
+            Some(b'!') => match self.read_bang_element() {
                 Ok((bang_type, bytes)) => self.state.emit_bang(bang_type, bytes),
                 Err(e) => {
                     // We want to report error at `<`, but offset was increased,
@@ -159,8 +158,8 @@ impl<'a> Reader<&'a [u8]> {
             //   `</tag attr=">` and text `" >` which probably no one existing parser
             //   does. This is malformed XML, however it is tolerated by some parsers
             //   (e.g. the one used by Adobe Flash) and such documents do exist in the wild.
-            Ok(Some(b'/')) => {
-                consume_one(&mut self.reader, &mut self.state.offset)?;
+            Some(b'/') => {
+                consume_one(&mut self.reader, &mut self.state.offset);
 
                 match self.read_element() {
                     Ok((name_len, bytes)) => self.state.emit_end(name_len, bytes),
@@ -173,7 +172,7 @@ impl<'a> Reader<&'a [u8]> {
                 }
             }
             // `<?` - processing instruction
-            Ok(Some(b'?')) => {
+            Some(b'?') => {
                 match self.read_with(PiParser(false)) {
                     Ok(bytes) => self.state.emit_question_mark(bytes),
                     Err(e) => {
@@ -185,7 +184,7 @@ impl<'a> Reader<&'a [u8]> {
                 }
             }
             // `<...` - opening or self-closed tag
-            Ok(Some(_)) => match self.read_element() {
+            Some(_) => match self.read_element() {
                 Ok((name_len, bytes)) => Ok(self.state.emit_start(name_len, bytes)),
                 Err(e) => {
                     // We want to report error at `<`, but offset was increased,
@@ -195,13 +194,12 @@ impl<'a> Reader<&'a [u8]> {
                 }
             },
             // `<` - syntax error, tag not closed
-            Ok(None) => {
+            None => {
                 // We want to report error at `<`, but offset was increased,
                 // so return it back (-1 for `<`)
                 self.state.last_error_offset = start - 1;
                 Err(Error::Syntax(SyntaxError::UnclosedTag))
             }
-            Err(e) => Err(Error::Io(e.into())),
         }
     }
 
@@ -412,20 +410,25 @@ impl<'a> Reader<&'a [u8]> {
     fn read_text_event(&mut self) -> Result<Event<'a>> {
         // Go to InsideMarkup or Done state
         if self.state.config.trim_text_start {
-            skip_whitespace(&mut self.reader, &mut self.state.offset)?;
+            skip_whitespace(&mut self.reader, &mut self.state.offset);
         }
+
+        match peek_one(self.reader) {
+            Some(b'<') => {
+                self.reader = &self.reader[1..];
+                self.state.offset += 1;
+                return self.read_until_close();
+            }
+            Some(b'&') => {
+                // Do not consume `&` because it may be lone and we would be need to
+                // return it as part of Text event
+                return self.read_ref_event();
+            }
+            _ => {}
+        };
 
         // Search for start of markup or an entity or character reference
         match memchr::memchr2(b'<', b'&', self.reader) {
-            Some(0) if self.reader[0] == b'<' => {
-                self.reader = &self.reader[1..];
-                self.state.offset += 1;
-
-                self.read_until_close()
-            }
-            // Do not consume `&` because it may be lone and we would be need to
-            // return it as part of Text event
-            Some(0) => self.read_ref_event(),
             Some(i) if self.reader[i] == b'<' => {
                 let bytes = &self.reader[..i];
                 self.reader = &self.reader[i + 1..];
@@ -594,42 +597,39 @@ impl<'a> Reader<&'a [u8]> {
 
 #[cfg(not(feature = "encoding"))]
 #[inline]
-fn remove_utf8_bom(source: &mut &[u8]) -> io::Result<()> {
+fn remove_utf8_bom(source: &mut &[u8]) -> () {
     if source.starts_with(crate::encoding::UTF8_BOM) {
         *source = &source[crate::encoding::UTF8_BOM.len()..];
     }
-    Ok(())
 }
 
 #[cfg(feature = "encoding")]
 #[inline]
-fn detect_encoding(source: &mut &[u8]) -> io::Result<Option<&'static Encoding>> {
+fn detect_encoding(source: &mut &[u8]) -> Option<&'static Encoding> {
     if let Some((enc, bom_len)) = crate::encoding::detect_encoding(source) {
         *source = &source[bom_len..];
-        return Ok(Some(enc));
+        return Some(enc);
     }
-    Ok(None)
+    None
 }
 
 #[inline]
-fn skip_whitespace(source: &mut &[u8], position: &mut u64) -> io::Result<()> {
+fn skip_whitespace(source: &mut &[u8], position: &mut u64) -> () {
     let whitespaces = source
         .iter()
         .position(|b| !is_whitespace(*b))
         .unwrap_or(source.len());
     *position += whitespaces as u64;
     *source = &source[whitespaces..];
-    Ok(())
 }
 
 #[inline]
-fn peek_one(source: &mut &[u8]) -> io::Result<Option<u8>> {
-    Ok(source.first().copied())
+fn peek_one(source: &[u8]) -> Option<u8> {
+    source.first().copied()
 }
 
 #[inline]
-fn consume_one(source: &mut &[u8], position: &mut u64) -> io::Result<()> {
+fn consume_one(source: &mut &[u8], position: &mut u64) -> () {
     *source = &source[1..];
     *position += 1;
-    Ok(())
 }
